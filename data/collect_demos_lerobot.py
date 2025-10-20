@@ -105,11 +105,29 @@ def collect_episode(env: FrankaPickPlaceEnv, hindered: bool, max_steps: int) -> 
     return buffer
 
 
-def write_metadata(dataset_root: Path, metadata: List[Dict[str, object]]) -> None:
+def write_metadata(dataset_root: Path, metadata: List[Dict[str, object]], train_fraction: float = 0.8) -> None:
+    """Write dataset metadata with train/val splits.
+    
+    Args:
+        dataset_root: Root directory for the dataset.
+        metadata: List of episode metadata dictionaries.
+        train_fraction: Fraction of episodes to use for training (default: 0.8).
+    """
+    num_episodes = len(metadata)
+    num_train = int(train_fraction * num_episodes)
+    
+    # Create train/val splits
+    train_episodes = [item["episode"] for item in metadata[:num_train]]
+    val_episodes = [item["episode"] for item in metadata[num_train:]]
+    
     payload = {
         "episodes": metadata,
         "num_static": sum(1 for item in metadata if not item.get("hindered", False)),
         "num_hindered": sum(1 for item in metadata if item.get("hindered", False)),
+        "splits": {
+            "train": train_episodes,
+            "val": val_episodes,
+        },
     }
     (dataset_root / "metadata.json").write_text(json.dumps(payload, indent=2))
 
@@ -119,6 +137,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", type=Path, default=Path("dataset"), help="Output directory for episodes.")
     parser.add_argument("--episodes", type=int, default=10, help="Number of episodes to record.")
     parser.add_argument("--hindered-fraction", type=float, default=0.2, help="Fraction of episodes with hindered resets.")
+    parser.add_argument("--train-fraction", type=float, default=0.8, help="Fraction of episodes to use for training (vs validation).")
     parser.add_argument("--max-steps", type=int, default=180, help="Maximum steps per episode.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility.")
     parser.add_argument("--gui", action="store_true", help="Enable the interactive MuJoCo viewer.")
@@ -155,9 +174,10 @@ def main() -> None:
         })
         print(f"Recorded episode {episode_idx:04d} | hindered={hindered} | steps={len(buffer.actions)}")
 
-    write_metadata(dataset_root, metadata)
+    write_metadata(dataset_root, metadata, train_fraction=args.train_fraction)
     env.close()
     print(f"Saved dataset with {len(metadata)} episodes to {dataset_root}")
+    print(f"Train/val split: {int(args.train_fraction * len(metadata))}/{len(metadata) - int(args.train_fraction * len(metadata))} episodes")
 
 
 if __name__ == "__main__":

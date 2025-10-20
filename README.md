@@ -96,8 +96,8 @@ print(obs.keys())  # {'rgb_static', 'proprio', ...}
 Observation shapes:
 ```python
 {
-  "rgb_static": (3, 224, 224),
-  "proprio": (8,)
+  "rgb_static": (3, 224, 224),  # Float32, normalized to [0, 1]
+  "proprio": (7,)                 # Joint positions (rad) for 7-DoF arm
 }
 ```
 

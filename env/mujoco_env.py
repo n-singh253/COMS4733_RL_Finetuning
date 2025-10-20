@@ -81,6 +81,8 @@ class FrankaPickPlaceEnv:
         self.max_steps = 200
         self.success_height = 0.3
         self.workspace_extent = np.array([0.25, 0.25])
+        self.bin_position = np.array([0.8, 0.25, 0.08])
+        self.bin_radius = 0.08
 
         self.viewer: Optional[object] = None
         if self.gui:
@@ -194,6 +196,13 @@ class FrankaPickPlaceEnv:
     # Observation helpers
     # ------------------------------------------------------------------
     def _get_obs(self) -> Dict[str, np.ndarray]:
+        """Get current observation dictionary.
+        
+        Returns:
+            Dictionary containing:
+                - "rgb_static": (H, W, 3) float32 RGB image normalized to [0, 1]
+                - "proprio": (7,) float32 joint positions in radians
+        """
         image = self.render(mode="rgb_array")
         if not np.all(np.isfinite(image)):
             raise RuntimeError("Rendered image contains non-finite values.")
@@ -212,8 +221,22 @@ class FrankaPickPlaceEnv:
         return -self._target_distance()
 
     def _check_success(self) -> bool:
+        """Check if the target object is successfully placed in the bin.
+        
+        Success requires:
+        1. Object height above success_height threshold (lifted off table)
+        2. Object within bin_radius of the bin's horizontal position
+        """
         site_id = self._object_site_ids[self._target_color]
-        return bool(self.data.site_xpos[site_id][2] >= self.success_height)
+        obj_pos = self.data.site_xpos[site_id]
+        
+        # Check height criterion
+        if obj_pos[2] < self.success_height:
+            return False
+        
+        # Check horizontal proximity to bin
+        horizontal_dist = np.linalg.norm(obj_pos[:2] - self.bin_position[:2])
+        return bool(horizontal_dist < self.bin_radius)
 
     # ------------------------------------------------------------------
     # Randomisation helpers
