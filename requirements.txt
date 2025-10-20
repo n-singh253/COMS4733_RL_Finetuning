@@ -1,0 +1,12 @@
+torch
+torchvision
+transformers
+mujoco
+gymnasium
+numpy
+opencv-python
+matplotlib
+pandas
+lerobot
+pyyaml
+pillow

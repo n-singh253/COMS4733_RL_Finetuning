@@ -1,0 +1,40 @@
+dataset:
+  path: ./dataset
+  train_split: train
+  val_split: val
+  batch_size: 16
+  num_workers: 8
+  sequence_length: 1
+  normalize_proprio: true
+  cache_dataset: false
+
+model:
+  vision_encoder: facebook/dinov2-base
+  language_encoder: bert-base-uncased
+  fusion_hidden_dim: 512
+  fusion_layers: 2
+  action_dim: 7
+  max_instruction_tokens: 64
+  freeze_vision: true
+  freeze_language: false
+  dropout: 0.1
+
+training:
+  epochs: 20
+  lr: 0.0001
+  weight_decay: 0.01
+  grad_clip: 1.0
+  device: cuda
+  seed: 42
+  log_interval: 10
+  val_interval: 1
+  checkpoint_dir: ./runs
+  checkpoint_name: dinov2_bc
+  mixed_precision: false
+  deterministic: false
+
+evaluation:
+  episodes_static: 50
+  episodes_hindered: 50
+  asset_root: ./env/mujoco_assets
+  render: false
