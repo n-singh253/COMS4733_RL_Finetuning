@@ -35,11 +35,11 @@ project/
 ## Full Pipeline Overview
 ```mermaid
 graph TD
-A[MuJoCo Environment] --> B[Demo Collection (collect_demos_lerobot.py)]
+A[MuJoCo Environment] --> B[Demo Collection: collect_demos_lerobot.py]
 B --> C[LeRobot Dataset]
-C --> D[Behavioral Cloning (train_bc.py)]
+C --> D[Behavioral Cloning: train_bc.py]
 D --> E[Trained VLA Model]
-E --> F[Evaluation (evaluate_bc_mujoco.py)]
+E --> F[Evaluation: evaluate_bc_mujoco.py]
 F --> G[Reports & Plots]
 ```
 1. **Simulate** the Franka Panda pick-and-place task in MuJoCo (static and hindered).
