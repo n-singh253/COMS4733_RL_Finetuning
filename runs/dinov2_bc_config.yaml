@@ -7,18 +7,16 @@ dataset:
   sequence_length: 1
   normalize_proprio: true
   cache_dataset: false
-
 model:
   vision_encoder: facebook/dinov2-base
   language_encoder: bert-base-uncased
   fusion_hidden_dim: 512
   fusion_layers: 2
-  action_dim: 8  # 7 joint positions + 1 gripper position
+  action_dim: 8
   max_instruction_tokens: 64
   freeze_vision: true
   freeze_language: false
   dropout: 0.1
-
 training:
   epochs: 20
   lr: 0.0001
@@ -32,7 +30,6 @@ training:
   checkpoint_name: dinov2_bc
   mixed_precision: false
   deterministic: false
-
 evaluation:
   episodes_static: 50
   episodes_hindered: 50

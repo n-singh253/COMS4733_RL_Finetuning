@@ -173,14 +173,19 @@ class LeRobotDataset(Dataset):
         if cache_key in self._episode_cache:
             return self._episode_cache[cache_key]
 
-        rgb_dir = episode.path / "rgb_static"
+        # Images and proprio are in the "obs" subdirectory
+        rgb_dir = episode.path / "obs" / "rgb_static"
         image_paths = []
         if rgb_dir.exists():
             image_paths = sorted(rgb_dir.glob("*.png"))
             if not image_paths:
                 image_paths = sorted(rgb_dir.glob("*.jpg"))
 
-        proprio_path = episode.path / "proprio.npy"
+        # Try obs/proprio.npy first (new format), fall back to proprio.npy (old format)
+        proprio_path = episode.path / "obs" / "proprio.npy"
+        if not proprio_path.exists():
+            proprio_path = episode.path / "proprio.npy"
+        
         actions_path = episode.path / "actions.npy"
         proprio = np.load(proprio_path) if proprio_path.exists() else np.zeros((episode.length, 7), dtype=np.float32)
         actions = np.load(actions_path)
