@@ -410,10 +410,10 @@ def write_metadata(dataset_root: Path, metadata: List[Dict[str, object]], train_
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect LeRobot demonstrations using MuJoCo.")
     parser.add_argument("--dataset", type=Path, default=Path("dataset"), help="Output directory for episodes.")
-    parser.add_argument("--episodes", type=int, default=10, help="Number of episodes to record.")
-    parser.add_argument("--hindered-fraction", type=float, default=0.2, help="Fraction of episodes with hindered resets.")
-    parser.add_argument("--train-fraction", type=float, default=0.8, help="Fraction of episodes to use for training (vs validation).")
-    parser.add_argument("--max-steps", type=int, default=400, help="Maximum steps per episode for full pick-and-place.")
+    parser.add_argument("--episodes", type=int, default=3, help="Number of episodes to record.")
+    parser.add_argument("--hindered-fraction", type=float, default=0.1, help="Fraction of episodes with hindered resets.")
+    parser.add_argument("--train-fraction", type=float, default=0.9, help="Fraction of episodes to use for training (vs validation).")
+    parser.add_argument("--max-steps", type=int, default=600, help="Maximum steps per episode for full pick-and-place.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility.")
     parser.add_argument("--gui", action="store_true", help="Enable the interactive MuJoCo viewer.")
     parser.add_argument(
