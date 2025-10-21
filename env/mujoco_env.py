@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover
 
 from .controllers import infer_actuated_joints
 
-DEFAULT_XML = "franka_scene.xml"
+DEFAULT_XML = "franka_emika_panda/task_scene.xml"
 _HIDDEN_POSE = np.array([2.0, 2.0, -1.0, 1.0, 0.0, 0.0, 0.0])
 _OBJECT_COLORS = ("red", "green", "blue", "yellow", "purple")
 
@@ -52,6 +52,7 @@ class FrankaPickPlaceEnv:
         width: int = 224,
         height: int = 224,
         seed: Optional[int] = 0,
+        camera_name: str = "top",
     ) -> None:
         if mujoco is None:  # pragma: no cover - handled at runtime
             raise ImportError(
@@ -59,10 +60,12 @@ class FrankaPickPlaceEnv:
                 " Franka assets in env/mujoco_assets/."
             )
 
-        self.asset_root = Path(asset_root)
+        # Convert to absolute path to avoid MuJoCo path resolution issues
+        self.asset_root = Path(asset_root).resolve()
         self.gui = gui
         self.width = width
         self.height = height
+        self.camera_name = camera_name
         self.rng = np.random.default_rng(seed)
 
         xml_path = self.asset_root / DEFAULT_XML
@@ -78,11 +81,11 @@ class FrankaPickPlaceEnv:
 
         self.step_dt = 0.04
         self.control_rate_hz = 1.0 / self.step_dt
-        self.max_steps = 200
-        self.success_height = 0.3
+        self.max_steps = 400  # Increased to allow full pick-and-place sequence
+        self.success_height = 0.15  # Height threshold for considering object "placed"
         self.workspace_extent = np.array([0.25, 0.25])
-        self.bin_position = np.array([0.8, 0.25, 0.08])
-        self.bin_radius = 0.08
+        self.bin_position = np.array([0.55, 0.45, 0.08])  # Closer to robot for easier center placement
+        self.bin_radius = 0.12  # Increased radius for easier placement
 
         self.viewer: Optional[object] = None
         if self.gui:
@@ -90,7 +93,7 @@ class FrankaPickPlaceEnv:
                 raise RuntimeError("MuJoCo viewer is unavailable; install mujoco>=2.3.5 or disable GUI mode.")
             self.viewer = mujoco_viewer.launch_passive(self.model, self.data)
 
-        self._gripper_site_id = self._get_site_id("panda_gripper_site")
+        self._gripper_site_id = self._get_site_id("gripper")
         self._object_body_ids = {color: self._get_body_id(f"object_body_{color}") for color in _OBJECT_COLORS}
         self._object_site_ids = {color: self._get_site_id(f"object_site_{color}") for color in _OBJECT_COLORS}
         self._object_qpos_addrs = {color: self._free_joint_qpos_addr(body_id) for color, body_id in self._object_body_ids.items()}
@@ -103,7 +106,9 @@ class FrankaPickPlaceEnv:
         self._joint_qpos_indices = joint_info.qpos_indices
         self._joint_dof_indices = joint_info.dof_indices
         self._joint_limits = joint_info.limits
-        self._home_configuration = self._default_qpos[self._joint_qpos_indices]
+        # Forward-reaching configuration for better workspace coverage
+        # This config starts lower (~30cm) and extends forward for pick-and-place
+        self._home_configuration = np.array([0.0, 0.3, 0.0, -1.5, 0.0, 1.8, 0.79])
 
         self._active_objects: Tuple[str, ...] = tuple(_OBJECT_COLORS[:3])
         self._target_color = "red"
@@ -115,7 +120,12 @@ class FrankaPickPlaceEnv:
         self._max_abs_velocity = 0.0
 
         if spaces is not None:
-            self.action_space = spaces.Box(low=-0.5, high=0.5, shape=(7,), dtype=np.float32)
+            # Action space: 7 joint velocities [-0.5, 0.5] + 1 gripper position [0, 255]
+            self.action_space = spaces.Box(
+                low=np.array([-2.8973]*7 + [0.0]),  # Joint position limits + gripper closed
+                high=np.array([2.8973]*7 + [0.04]),  # Joint position limits + gripper open
+                dtype=np.float32
+            )
             self.observation_space = spaces.Dict(
                 {
                     "rgb_static": spaces.Box(low=0.0, high=1.0, shape=(self.height, self.width, 3), dtype=np.float32),
@@ -155,17 +165,25 @@ class FrankaPickPlaceEnv:
 
     def step(self, action: np.ndarray) -> StepResult:
         action = np.asarray(action, dtype=np.float64)
-        if action.shape != (7,):
-            raise ValueError("Action must be a 7-D joint velocity vector.")
+        if action.shape != (8,):
+            raise ValueError("Action must be an 8-D vector: 7 joint positions + 1 gripper position.")
         if not np.all(np.isfinite(action)):
             raise ValueError("Action contains non-finite values.")
 
-        self._last_action = np.clip(action, -0.5, 0.5)
+        # Split action into arm positions and gripper position
+        arm_positions = action[:7]
+        gripper_position = action[7]
+        
+        # Clip arm positions to joint limits
+        self._last_action = np.clip(arm_positions, -2.8973, 2.8973)
         if self.model.nu >= 7:
+            # Position control: send target positions directly
             self.data.ctrl[:7] = self._last_action
-            self.data.ctrl[:] = np.clip(self.data.ctrl, -1.0, 1.0)
+            # Apply gripper position (actuator 8 uses different range)
+            if self.model.nu >= 8:
+                self.data.ctrl[7] = np.clip(gripper_position, 0.0, 0.04)  # Gripper range is 0-0.04m
         else:  # pragma: no cover - fallback
-            self.data.qvel[self._joint_dof_indices] = self._last_action
+            self.data.qpos[self._joint_qpos_indices] = self._last_action
 
         substeps = max(1, int(round(self.step_dt / self.model.opt.timestep)))
         for _ in range(substeps):
@@ -224,19 +242,34 @@ class FrankaPickPlaceEnv:
         """Check if the target object is successfully placed in the bin.
         
         Success requires:
-        1. Object height above success_height threshold (lifted off table)
-        2. Object within bin_radius of the bin's horizontal position
+        1. Object within bin_radius of the bin's horizontal position
+        2. Object at VERY LOW height (< 0.08m) - actually in the bin, not just passing by
+        3. Object velocity low (< 0.1 m/s) - at rest, not being dropped
         """
         site_id = self._object_site_ids[self._target_color]
+        body_id = self._object_body_ids[self._target_color]
         obj_pos = self.data.site_xpos[site_id]
-        
-        # Check height criterion
-        if obj_pos[2] < self.success_height:
-            return False
         
         # Check horizontal proximity to bin
         horizontal_dist = np.linalg.norm(obj_pos[:2] - self.bin_position[:2])
-        return bool(horizontal_dist < self.bin_radius)
+        if horizontal_dist >= self.bin_radius:
+            return False
+        
+        # Check that object is IN the bin (very low height < 0.08m)
+        # Bin floor is at ~0.02m, walls at 0.06m, so < 0.08m means actually in bin
+        if obj_pos[2] >= 0.08:
+            return False
+        
+        # Check that object is at rest (not being actively dropped)
+        # Get object velocity from body velocities
+        body_vel_adr = self.model.body_dofadr[body_id]
+        if body_vel_adr >= 0:  # Body has DOFs
+            body_vel = self.data.qvel[body_vel_adr:body_vel_adr+6]  # 6 DOF (3 pos + 3 rot)
+            linear_vel = np.linalg.norm(body_vel[:3])
+            if linear_vel > 0.1:  # Moving faster than 0.1 m/s
+                return False
+        
+        return True
 
     # ------------------------------------------------------------------
     # Randomisation helpers
@@ -253,8 +286,11 @@ class FrankaPickPlaceEnv:
         for color in _OBJECT_COLORS:
             addr = self._object_qpos_addrs[color]
             if color in active:
-                xy = self.rng.uniform(-self.workspace_extent, self.workspace_extent)
-                pos = np.array([0.5 + xy[0], xy[1], 0.035], dtype=np.float64)
+                # Place objects in the working zone (0.45-0.55m forward, ±0.25m lateral)
+                # This range has proven successful grasping with our keyframes
+                x = self.rng.uniform(0.45, 0.55)
+                y = self.rng.uniform(-0.25, 0.25)
+                pos = np.array([x, y, 0.035], dtype=np.float64)
                 quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
                 self._set_free_joint_pose(addr, pos, quat)
             else:
@@ -262,8 +298,8 @@ class FrankaPickPlaceEnv:
         return active
 
     def _apply_hindered_modifications(self) -> None:
-        # Reset lighting
-        self.model.light_ambient[self._light_id] = np.array([0.4, 0.4, 0.4, 1.0])
+        # Reset lighting (light attributes are 3D RGB arrays)
+        self.model.light_ambient[self._light_id] = np.array([0.4, 0.4, 0.4])
         self.model.light_diffuse[self._light_id] = np.array([0.6, 0.6, 0.6])
 
         if not self._hindered:
@@ -302,9 +338,10 @@ class FrankaPickPlaceEnv:
     # ------------------------------------------------------------------
     def render(self, mode: str = "rgb_array") -> np.ndarray:
         if mode == "rgb_array":
-            self.renderer.update_scene(self.data)
+            self.renderer.update_scene(self.data, camera=self.camera_name)
             rgb = self.renderer.render()
-            return np.clip(rgb, 0.0, 1.0).astype(np.float32)
+            # Convert from uint8 [0, 255] to float32 [0, 1]
+            return (rgb / 255.0).astype(np.float32)
         if mode == "human":  # pragma: no cover - viewer only
             if self.viewer is None:
                 raise RuntimeError("Viewer not initialised; construct environment with gui=True.")
@@ -381,18 +418,321 @@ class FrankaPickPlaceEnv:
 
 
 def _smoke_test(asset_root: Path) -> None:  # pragma: no cover - CLI helper
-    env = FrankaPickPlaceEnv(asset_root=asset_root, gui=False)
+    from .controllers import KinematicsHelper, quat_to_axis_angle, quat_multiply, quat_conjugate
+    
+    env = FrankaPickPlaceEnv(asset_root=asset_root, gui=True)
     obs, info = env.reset()
     print("Reset observation keys:", obs.keys())
     print("Instruction:", info["instruction"])
-    for _ in range(5):
-        action = np.zeros(7)
+    
+    # Create kinematics helper for Jacobian-based control
+    kin_helper = KinematicsHelper(env.model, site_name="gripper")
+    
+    # Extract the initial "good" downward orientation as reference
+    initial_gripper_quat = np.zeros(4, dtype=np.float64)
+    import mujoco
+    mujoco.mju_mat2Quat(initial_gripper_quat, env.data.site_xmat[env._gripper_site_id])
+    print(f"Initial gripper quaternion (good downward orientation): {initial_gripper_quat}")
+    downward_quat_reference = initial_gripper_quat.copy()
+    
+    # Control frequency management - run Jacobian control at 50Hz instead of per-step
+    CONTROL_HZ = 50  # Standard control frequency for Franka Cartesian control
+    control_decimation = max(1, int(round(1.0 / (CONTROL_HZ * 0.02))))  # assuming 50Hz physics
+    
+    # Initialize cached action
+    if not hasattr(env, '_last_jacobian_action'):
+        env._last_jacobian_action = np.zeros(7)  # type: ignore
+    
+    for step_idx in range(300):
+        # Multi-phase proportional controller with 6D control (position + orientation)
+        target_site = env._object_site_ids[env._target_color]
+        target_pos = env.data.site_xpos[target_site]
+        gripper_pos = env.data.site_xpos[env._gripper_site_id]
+        
+        # Compute position error
+        error = target_pos - gripper_pos
+        horizontal_error = np.array([error[0], error[1], 0.0])
+        horizontal_dist = np.linalg.norm(horizontal_error[:2])
+        
+        # Get bin position for placement phase
+        bin_pos = env.bin_position
+        bin_horizontal_dist = np.linalg.norm(target_pos[:2] - bin_pos[:2])
+        
+        gain = 2.0  # More aggressive for faster convergence (Step 4 from plan)
+        
+        # Track descent phase
+        if not hasattr(env, '_descent_phase_active'):
+            env._descent_phase_active = False  # type: ignore
+            env._ik_recompute_counter = 0  # type: ignore
+        
+        # Multi-phase pick-and-place behavior with vertical descent
+        # Use different thresholds for entering vs staying in descend phase (hysteresis)
+        # All values in meters: 0.01 = 10mm, 0.02 = 20mm
+        # Increased to 0.20 (200mm) to account for kinematic limits at lower heights
+        descend_entry_threshold = 0.20  # Must be within 200mm before entering descent phase
+        descend_exit_threshold = 0.70  # Much larger hysteresis to prevent phase bouncing
+        orientation_threshold = 75.0  # Relaxed from 15 to 75 degrees - focus on position first
+        
+        # Compute gripper orientation before phase checks (needs to be before phase logic)
+        current_mat_temp = env.data.site_xmat[env._gripper_site_id].reshape(3, 3)
+        local_z_temp = current_mat_temp[:, 2]
+        desired_axis_temp = np.array([0.0, 0.0, -1.0])
+        cos_angle_temp = float(np.clip(np.dot(local_z_temp, desired_axis_temp), -1.0, 1.0))
+        angle_deg = float(np.arccos(cos_angle_temp) * 180.0 / np.pi)
+        
+        # Check if we can descend: use position only, orientation will naturally improve during descent
+        can_descend = horizontal_dist <= descend_entry_threshold
+        
+        # Track whether we've actually started descending (state-based, not just distance threshold)
+        if not hasattr(env, '_is_in_descent_phase'):
+            env._is_in_descent_phase = False  # type: ignore
+        
+        # Enter descent phase ONLY when can_descend is True
+        if can_descend:
+            env._is_in_descent_phase = True  # type: ignore
+        
+        # Exit descent phase when far away (hysteresis)
+        if horizontal_dist > descend_exit_threshold:
+            env._is_in_descent_phase = False  # type: ignore
+        
+        is_descending = env._is_in_descent_phase  # type: ignore
+        
+        # Don't use separate ORIENT phase - let orientation improve naturally
+        orientation_good = True  # Always proceed with positioning
+        
+        # Get current joint configuration (needed for both IK and Jacobian control)
+        current_q = env.data.qpos[env._joint_qpos_indices].copy()
+        
+        # Step 1: Control frequency management - only recompute Jacobian control every N steps
+        recompute_control = (step_idx % control_decimation == 0)
+        
+        if recompute_control and target_pos[2] < 0.1 and not can_descend:
+            # Phase 1: POSITION - IK-based planning with joint-space tracking
+            env._descent_phase_active = False  # type: ignore
+            
+            safe_height = 0.15  # Increased from 0.10 for better workspace
+            # CRITICAL: Keep current height until horizontally converged
+            horizontal_dist_2d = np.linalg.norm(target_pos[:2] - gripper_pos[:2])
+            if horizontal_dist_2d > 0.08:  # Far horizontally: stay at current height
+                above_ball_pos = np.array([target_pos[0], target_pos[1], gripper_pos[2]])
+            else:  # Close horizontally: can descend to safe height
+                above_ball_pos = np.array([target_pos[0], target_pos[1], safe_height])
+            
+            # Compute distance-based IK weighting
+            horizontal_dist_3d = np.linalg.norm(above_ball_pos[:2] - gripper_pos[:2])
+            
+            # Adaptive weighting: relax orientation when far/high
+            if gripper_pos[2] > 0.20:  # High Z: prioritize position heavily
+                pos_weight, ori_weight = 10.0, 0.1
+            elif horizontal_dist_3d > 0.15:  # Far: moderate position priority
+                pos_weight, ori_weight = 5.0, 0.5
+            elif horizontal_dist_3d > 0.08:  # Medium: balanced
+                pos_weight, ori_weight = 2.0, 1.0
+            else:  # Close: fully balanced
+                pos_weight, ori_weight = 1.0, 1.0
+            
+            # APPROACH 2: Use IK to compute target joint configuration, then track it
+            try:
+                target_q = kin_helper.inverse_kinematics(
+                    target_pos=above_ball_pos,
+                    target_quat=downward_quat_reference,
+                    initial_q=current_q,
+                    max_iters=150,  # Increased for better convergence
+                    position_weight=pos_weight,
+                    orientation_weight=ori_weight,
+                    damping=0.01,
+                    step_size=0.5,
+                )
+                
+                # Simple joint-space PD control to track the target configuration
+                joint_error = target_q - current_q
+                joint_vel = 0.5 * joint_error  # Proportional gain of 0.5
+                
+                # Convert to position command
+                action = joint_vel * 0.02
+                action = np.clip(action, -0.05, 0.05)
+                
+            except RuntimeError:
+                # IK failed to converge - fall back to current position
+                action = np.zeros(7)
+            
+            # Diagnostic logging
+            if step_idx % 20 == 0:
+                ik_success = "IK_OK" if 'target_q' in locals() else "IK_FAIL"
+                print(f"  [POSITION-IK] horiz_dist={horizontal_dist*1000:.1f}mm "
+                      f"pos_w={pos_weight:.1f} ori_w={ori_weight:.1f} "
+                      f"{ik_success} "
+                      f"gripper_z={gripper_pos[2]*100:.1f}cm "
+                      f"angle_deg={angle_deg:.1f}°")
+            
+            env._last_jacobian_action = action  # Cache for next steps
+        
+        elif recompute_control and target_pos[2] < 0.1 and (can_descend or is_descending):
+            # Phase 2: DESCEND - IK-based planning with joint-space tracking
+            
+            horizontal_error_val = np.linalg.norm(horizontal_error[:2])
+            
+            # Staged descent: fix XY first, then Z
+            if horizontal_error_val > 0.060:
+                target_offset = np.array([target_pos[0], target_pos[1], gripper_pos[2]])
+            else:
+                target_offset = np.array([target_pos[0], target_pos[1], 0.04])
+            
+            # Balanced weighting during descent
+            pos_weight, ori_weight = 2.0, 1.0
+            
+            # IK-based planning
+            try:
+                target_q = kin_helper.inverse_kinematics(
+                    target_pos=target_offset,
+                    target_quat=downward_quat_reference,
+                    initial_q=current_q,
+                    max_iters=150,  # Increased for better convergence
+                    position_weight=pos_weight,
+                    orientation_weight=ori_weight,
+                    damping=0.01,
+                    step_size=0.5,
+                )
+                
+                # Joint-space PD tracking
+                joint_error = target_q - current_q
+                joint_vel = 0.5 * joint_error
+                
+                action = joint_vel * 0.02
+                action = np.clip(action, -0.05, 0.05)
+                
+            except RuntimeError:
+                action = np.zeros(7)
+            
+            if step_idx % 10 == 0:
+                ik_success = "IK_OK" if 'target_q' in locals() else "IK_FAIL"
+                print(f"  [DESCEND-IK] horiz_err={horizontal_error_val*1000:.1f}mm "
+                      f"{ik_success} "
+                      f"gripper_z={gripper_pos[2]*100:.1f}cm "
+                      f"angle_deg={angle_deg:.1f}°")
+            
+            env._last_jacobian_action = action  # Cache for next steps
+        
+        elif recompute_control:
+            # Phases 3-5: Use Jacobian control for lift, transport, place
+            # Reset descent phase tracking when in other phases
+            env._descent_phase_active = False  # type: ignore
+            
+            if target_pos[2] >= 0.1 and target_pos[2] < 0.25:
+                # Phase 3: Lift - Object grasped, lift it up to safe carrying height
+                lift_height = 0.3
+                desired_pos_vel = gain * np.array([0.0, 0.0, lift_height - target_pos[2]])
+            elif bin_horizontal_dist > 0.1:
+                # Phase 4: Transport - Carry object to bin horizontally at safe height
+                bin_horizontal_error = bin_pos[:2] - target_pos[:2]
+                desired_pos_vel = gain * np.array([bin_horizontal_error[0], bin_horizontal_error[1], 0.0])
+            else:
+                # Phase 5: Place - Above bin, descend to place object
+                bin_error = bin_pos - target_pos
+                desired_pos_vel = gain * bin_error
+            
+            # Cross-product orientation control for later phases
+            current_mat = env.data.site_xmat[env._gripper_site_id].reshape(3, 3)
+            local_z_in_world = current_mat[:, 2]
+            desired_axis = np.array([0.0, 0.0, -1.0])
+            axis_err = np.cross(local_z_in_world, desired_axis)
+            sin_angle = np.linalg.norm(axis_err)
+            if sin_angle < 1e-6:
+                desired_ang_vel = np.zeros(3)
+            else:
+                axis_err /= sin_angle
+                cos_angle = float(np.clip(np.dot(local_z_in_world, desired_axis), -1.0, 1.0))
+                angle = float(np.arccos(cos_angle))
+                orientation_gain = 2.0 * gain
+                desired_ang_vel = orientation_gain * angle * axis_err
+                desired_ang_vel = np.clip(desired_ang_vel, -0.5, 0.5)
+            
+            # Combine position and orientation
+            desired_cart_vel = np.concatenate([desired_pos_vel, desired_ang_vel])
+            
+            # Jacobian-based control
+            jac = kin_helper.analytic_jacobian(current_q)
+            lambda_damping = 0.05  # Standard damping
+            jac_damped = jac.T @ np.linalg.inv(jac @ jac.T + lambda_damping * np.eye(6))
+            
+            # Compute joint-space command
+            joint_command = jac_damped @ desired_cart_vel
+            
+            # Null-space control
+            forward_home = np.array([0.0, 0.3, 0.0, -1.5, 0.0, 1.8, 0.79])
+            null_space_proj = np.eye(7) - jac_damped @ jac
+            home_error = forward_home - current_q
+            null_space_gains = np.array([0.3, 0.5, 0.3, 0.4, 0.3, 0.3, 0.2])
+            null_space_command = null_space_proj @ (null_space_gains * home_error)
+            joint_command += null_space_command
+            
+            # Scale and clip for position control at 50Hz
+            action = joint_command * 0.02
+            action = np.clip(action, -0.1, 0.1)  # Allow more motion for lift/transport
+            env._last_jacobian_action = action  # Cache for next steps
+        
+        else:
+            # Not recomputing - reuse cached action from previous control step
+            action = env._last_jacobian_action
+        
+        # Add gripper control
+        dist_to_target = np.linalg.norm(gripper_pos - target_pos)
+        
+        if target_pos[2] < 0.1 and not can_descend:
+            # Phase 1: Positioning above - gripper open
+            gripper_cmd = 0.04
+        elif target_pos[2] < 0.1 and (can_descend or is_descending):
+            # Phase 2: Descending - close gripper when within millimeters for precision grasp
+            # Wait until very close for reliable contact
+            if dist_to_target < 0.025:  # Close when within 25mm of ball center
+                gripper_cmd = 0.0
+            else:
+                gripper_cmd = 0.04  # Keep open while approaching
+        elif target_pos[2] >= 0.1 and bin_horizontal_dist > 0.08:
+            # Phase 3 & 4: Lifting and transporting - gripper closed
+            gripper_cmd = 0.0
+        else:
+            # Phase 5: Placing - gripper open to release
+            gripper_cmd = 0.04
+        
+        # For position control, compute target joint positions
+        # All phases use Jacobian control now
+        target_joint_positions = current_q + action
+        
+        # Clip to joint limits for safety
+        target_joint_positions = np.clip(target_joint_positions, -2.8973, 2.8973)
+        
+        action = np.concatenate([target_joint_positions, [gripper_cmd]])
+        
         result = env.step(action)
+        
+        # Sync the viewer to display the updated state
+        if env.viewer is not None:
+            env.viewer.sync()
+        
+        if step_idx % 40 == 0:
+            obj_height = target_pos[2]
+            bin_dist = bin_horizontal_dist
+            # Determine phase
+            if target_pos[2] < 0.1 and not can_descend:
+                phase = "POSITION"
+            elif target_pos[2] < 0.1 and (can_descend or is_descending):
+                phase = "DESCEND"
+            elif target_pos[2] >= 0.1 and target_pos[2] < 0.25:
+                phase = "LIFT"
+            elif bin_horizontal_dist > 0.1:
+                phase = "TRANSPORT"
+            else:
+                phase = "PLACE"
+            
         print(
-            f"step success={result.info['success']} reward={result.reward:.3f} "
-            f"distance={result.info['distance']:.3f}"
+                f"step {step_idx:3d} | {phase:9s} | success={result.info['success']} "
+                f"reward={result.reward:+.3f} | dist={result.info['distance']:.3f} "
+                f"horiz_dist={horizontal_dist:.3f} angle_deg={angle_deg:.1f} can_desc={can_descend} "
+                f"obj_z={obj_height:.3f} bin_dist={bin_dist:.3f} gripper={gripper_cmd:.3f}"
         )
         if result.terminated or result.truncated:
+            print(f"\nEpisode finished at step {step_idx}! Success: {result.info['success']}")
             break
     env.close()
 

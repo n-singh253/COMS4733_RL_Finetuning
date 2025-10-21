@@ -21,7 +21,7 @@ class CameraParameters:
     resolution: Tuple[int, int]
 
 
-def get_camera_parameters(model: "mujoco.MjModel", camera_name: str) -> CameraParameters:
+def get_camera_parameters(model: "mujoco.MjModel", camera_name: str, resolution: Tuple[int, int] = (224, 224)) -> CameraParameters:
     if mujoco is None:  # pragma: no cover
         raise ImportError("MuJoCo is required for camera utilities")
 
@@ -32,8 +32,8 @@ def get_camera_parameters(model: "mujoco.MjModel", camera_name: str) -> CameraPa
     pos = model.cam_pos[cam_id].copy()
     quat = model.cam_quat[cam_id].copy()
     fovy = float(model.cam_fovy[cam_id])
-    res = tuple(int(x) for x in model.cam_resolution[cam_id])
-    return CameraParameters(camera_name, pos, quat, fovy, res)
+    # Use provided resolution as cam_resolution may not be set in XML
+    return CameraParameters(camera_name, pos, quat, fovy, resolution)
 
 
 def project_point(point: np.ndarray, params: CameraParameters) -> np.ndarray:

@@ -134,7 +134,7 @@ class KinematicsHelper:
         self,
         model: "mujoco.MjModel",
         *,
-        site_name: str = "panda_gripper_site",
+        site_name: str = "gripper",
         joint_info: Optional[ActuatedJointInfo] = None,
     ) -> None:
         if mujoco is None:  # pragma: no cover
@@ -154,7 +154,9 @@ class KinematicsHelper:
         self._apply_configuration(q)
         mujoco.mj_forward(self.model, self.data)
         pos = self.data.site_xpos[self.site_id].copy()
-        quat = self.data.site_xquat[self.site_id].copy()
+        # Convert rotation matrix to quaternion (MuJoCo 3.x API)
+        quat = np.zeros(4, dtype=np.float64)
+        mujoco.mju_mat2Quat(quat, self.data.site_xmat[self.site_id])
         return pos, quat
 
     def analytic_jacobian(self, q: Sequence[float]) -> np.ndarray:
@@ -188,6 +190,13 @@ class KinematicsHelper:
         value = float(np.linalg.det(gram))
         return max(value, 0.0)
 
+    def verify_jacobian(self, q: Sequence[float], eps: float = 1e-6, tol: float = 1e-3) -> bool:
+        """Verify analytic Jacobian against finite-difference approximation."""
+        jac_analytic = self.analytic_jacobian(q)
+        jac_fd = self.finite_difference_jacobian(q, eps=eps)
+        error = np.linalg.norm(jac_analytic - jac_fd)
+        return error < tol
+
     def inverse_kinematics(
         self,
         target_pos: Sequence[float],
@@ -199,7 +208,10 @@ class KinematicsHelper:
         tol_ori: float = math.radians(2.0),
         damping: float = 1e-4,
         step_size: float = 1.0,
+        position_weight: float = 1.0,
+        orientation_weight: float = 1.0,
     ) -> np.ndarray:
+        """Damped least-squares IK with weighted position and orientation errors."""
         q = np.asarray(initial_q if initial_q is not None else self.model.qpos0[self.joint_info.qpos_indices], dtype=np.float64)
         target_pos = np.asarray(target_pos, dtype=np.float64)
         target_quat = _quat_normalize(np.asarray(target_quat, dtype=np.float64))
@@ -208,16 +220,185 @@ class KinematicsHelper:
             pos, quat = self.forward_kinematics(q)
             pos_error = target_pos - pos
             orient_error = _quat_to_axis_angle(_quat_multiply(_quat_conjugate(quat), target_quat))
+            
+            # Check convergence
             if np.linalg.norm(pos_error) < tol_pos and np.linalg.norm(orient_error) < tol_ori:
                 return q
+            
+            # Weighted error for prioritization
+            weighted_pos_error = position_weight * pos_error
+            weighted_ori_error = orientation_weight * orient_error
+            error = np.concatenate([weighted_pos_error, weighted_ori_error])
+            
             jac = self.analytic_jacobian(q)
-            error = np.concatenate([pos_error, orient_error])
-            jtj = jac.T @ jac + damping * np.eye(jac.shape[1])
-            dq = step_size * np.linalg.solve(jtj, jac.T @ error)
+            # Apply weights to Jacobian rows as well
+            weight_matrix = np.diag([position_weight] * 3 + [orientation_weight] * 3)
+            weighted_jac = weight_matrix @ jac
+            
+            jtj = weighted_jac.T @ weighted_jac + damping * np.eye(jac.shape[1])
+            dq = step_size * np.linalg.solve(jtj, weighted_jac.T @ error)
             q = q + dq
             q = self._clamp_to_limits(q)
 
         raise RuntimeError("IK failed to converge within the allotted iterations")
+    
+    def inverse_kinematics_ccd(
+        self,
+        target_pos: Sequence[float],
+        target_quat: Sequence[float],
+        *,
+        initial_q: Optional[Sequence[float]] = None,
+        max_iters: int = 100,
+        tol_pos: float = 1e-3,
+        tol_ori: float = math.radians(5.0),
+        position_weight: float = 3.0,
+        orientation_weight: float = 1.0,
+    ) -> np.ndarray:
+        """Cyclic Coordinate Descent IK - optimizes one joint at a time."""
+        q = np.asarray(initial_q if initial_q is not None else self.model.qpos0[self.joint_info.qpos_indices], dtype=np.float64)
+        target_pos = np.asarray(target_pos, dtype=np.float64)
+        target_quat = _quat_normalize(np.asarray(target_quat, dtype=np.float64))
+        
+        best_q = q.copy()
+        best_error = float('inf')
+        
+        for iteration in range(max_iters):
+            # Cycle through all joints
+            for joint_idx in range(len(q)):
+                # Current end-effector pose
+                pos, quat = self.forward_kinematics(q)
+                pos_error = target_pos - pos
+                orient_error = _quat_to_axis_angle(_quat_multiply(_quat_conjugate(quat), target_quat))
+                
+                # Weighted total error
+                total_error = (position_weight * np.linalg.norm(pos_error) + 
+                             orientation_weight * np.linalg.norm(orient_error))
+                
+                # Track best solution
+                if total_error < best_error:
+                    best_error = total_error
+                    best_q = q.copy()
+                
+                # Check convergence
+                if np.linalg.norm(pos_error) < tol_pos and np.linalg.norm(orient_error) < tol_ori:
+                    return q
+                
+                # Optimize this joint using gradient
+                current_val = q[joint_idx]
+                delta = 0.01  # Small step for numerical gradient
+                
+                # Try small perturbations
+                best_local_error = total_error
+                best_local_dq = 0.0
+                
+                for dq in [-delta, delta]:
+                    q[joint_idx] = current_val + dq
+                    q[joint_idx] = self._clamp_to_limits(q)[joint_idx]
+                    
+                    pos_test, quat_test = self.forward_kinematics(q)
+                    pos_err_test = target_pos - pos_test
+                    ori_err_test = _quat_to_axis_angle(_quat_multiply(_quat_conjugate(quat_test), target_quat))
+                    
+                    error_test = (position_weight * np.linalg.norm(pos_err_test) + 
+                                orientation_weight * np.linalg.norm(ori_err_test))
+                    
+                    if error_test < best_local_error:
+                        best_local_error = error_test
+                        best_local_dq = dq
+                
+                # Apply best local change
+                if best_local_dq != 0.0:
+                    q[joint_idx] = current_val + best_local_dq * 0.5  # Damped step
+                else:
+                    q[joint_idx] = current_val
+                
+                q = self._clamp_to_limits(q)
+        
+        # Return best found solution even if not converged
+        return best_q
+
+    def inverse_kinematics_staged(
+        self,
+        target_pos: Sequence[float],
+        target_quat: Sequence[float],
+        *,
+        initial_q: Optional[Sequence[float]] = None,
+        horizontal_distance: float = 0.0,
+        max_iters: int = 100,
+        damping: float = 0.01,
+    ) -> np.ndarray:
+        """Staged IK: prioritize position when far, balance when close."""
+        # Adaptive weighting based on distance
+        if horizontal_distance > 0.1:  # Far: 100% position priority
+            pos_weight, ori_weight = 10.0, 0.1
+        elif horizontal_distance > 0.06:  # Medium: gentle orientation
+            pos_weight, ori_weight = 5.0, 0.5
+        else:  # Close: balanced
+            pos_weight, ori_weight = 1.0, 1.0
+        
+        return self.inverse_kinematics(
+            target_pos, target_quat,
+            initial_q=initial_q,
+            max_iters=max_iters,
+            damping=damping,
+            position_weight=pos_weight,
+            orientation_weight=ori_weight,
+        )
+
+    def ik_velocity_step(
+        self,
+        current_q: np.ndarray,
+        target_pos: np.ndarray,
+        target_quat: np.ndarray,
+        *,
+        position_weight: float = 1.0,
+        orientation_weight: float = 1.0,
+        damping: float = 0.05,
+        gain: float = 1.0,
+    ) -> np.ndarray:
+        """Single IK iteration for velocity control at high frequency."""
+        pos, quat = self.forward_kinematics(current_q)
+        pos_error = target_pos - pos
+        orient_error = _quat_to_axis_angle(
+            _quat_multiply(_quat_conjugate(quat), target_quat)
+        )
+        
+        # Weighted 6D error
+        weighted_error = np.concatenate([
+            position_weight * pos_error,
+            orientation_weight * orient_error
+        ])
+        
+        # Damped least-squares Jacobian
+        jac = self.analytic_jacobian(current_q)
+        weight_matrix = np.diag([position_weight] * 3 + [orientation_weight] * 3)
+        weighted_jac = weight_matrix @ jac
+        jac_damped = weighted_jac.T @ np.linalg.inv(
+            weighted_jac @ weighted_jac.T + damping * np.eye(6)
+        )
+        
+        # Joint velocity command
+        joint_vel = gain * jac_damped @ weighted_error
+        return joint_vel
+
+    def null_space_control(
+        self,
+        current_q: np.ndarray,
+        jacobian: np.ndarray,
+        home_config: np.ndarray,
+        gains: np.ndarray,
+    ) -> np.ndarray:
+        """Compute null-space control for secondary objectives."""
+        # Damped pseudo-inverse for null-space projection
+        jac_damped = jacobian.T @ np.linalg.inv(
+            jacobian @ jacobian.T + 0.05 * np.eye(6)
+        )
+        null_proj = np.eye(7) - jac_damped @ jacobian
+        
+        # Secondary objective: return to home configuration
+        home_error = home_config - current_q
+        null_cmd = null_proj @ (gains * home_error)
+        return null_cmd
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -237,10 +418,138 @@ class KinematicsHelper:
         return q
 
 
+class KeyframeController:
+    """Controller for smooth interpolation between keyframe joint configurations."""
+    
+    def __init__(
+        self,
+        keyframes: dict[str, np.ndarray],
+        convergence_threshold: float = 0.05,  # radians
+        velocity_threshold: float = 0.1,  # rad/s
+    ):
+        """
+        Initialize keyframe controller.
+        
+        Args:
+            keyframes: Dictionary mapping keyframe names to joint configurations
+            convergence_threshold: Joint position error threshold to consider converged
+            velocity_threshold: Joint velocity threshold to consider stationary
+        """
+        self.keyframes = keyframes
+        self.convergence_threshold = convergence_threshold
+        self.velocity_threshold = velocity_threshold
+        
+        # Current state
+        self.current_keyframe_idx = 0
+        self.keyframe_sequence = []  # Will be set via set_sequence
+        
+    def set_sequence(self, sequence: list[str]) -> None:
+        """Set the sequence of keyframes to execute."""
+        self.keyframe_sequence = sequence
+        self.current_keyframe_idx = 0
+        
+    def get_current_target(self) -> tuple[str, np.ndarray]:
+        """Get the current target keyframe name and joint configuration."""
+        if self.current_keyframe_idx >= len(self.keyframe_sequence):
+            # Return last keyframe if sequence is complete
+            name = self.keyframe_sequence[-1]
+            return name, self.keyframes[name]
+        
+        name = self.keyframe_sequence[self.current_keyframe_idx]
+        return name, self.keyframes[name]
+    
+    def check_convergence(
+        self,
+        current_q: np.ndarray,
+        current_qvel: np.ndarray,
+        target_q: np.ndarray,
+    ) -> bool:
+        """
+        Check if robot has converged to target configuration.
+        
+        Args:
+            current_q: Current joint positions
+            current_qvel: Current joint velocities
+            target_q: Target joint positions
+            
+        Returns:
+            True if converged (position error small AND velocity small)
+        """
+        position_error = np.linalg.norm(target_q - current_q)
+        velocity_norm = np.linalg.norm(current_qvel)
+        
+        position_converged = position_error < self.convergence_threshold
+        velocity_converged = velocity_norm < self.velocity_threshold
+        
+        return position_converged and velocity_converged
+    
+    def advance_to_next_keyframe(self) -> bool:
+        """
+        Advance to the next keyframe in the sequence.
+        
+        Returns:
+            True if advanced, False if already at last keyframe
+        """
+        if self.current_keyframe_idx < len(self.keyframe_sequence) - 1:
+            self.current_keyframe_idx += 1
+            return True
+        return False
+    
+    def is_sequence_complete(self) -> bool:
+        """Check if we've reached the end of the keyframe sequence."""
+        return self.current_keyframe_idx >= len(self.keyframe_sequence) - 1
+    
+    def get_progress(self) -> tuple[int, int]:
+        """Get current progress (current_idx, total_keyframes)."""
+        return self.current_keyframe_idx, len(self.keyframe_sequence)
+
+
+def compute_pick_place_keyframes(
+    kin_helper: KinematicsHelper,
+    object_pos: np.ndarray,
+    bin_pos: np.ndarray,
+    base_keyframes: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """
+    Compute adapted keyframes for a specific object and bin position.
+    
+    This uses base keyframes and adjusts them based on the actual object
+    and bin positions to provide variety while maintaining reliability.
+    
+    Args:
+        kin_helper: Kinematics helper for IK
+        object_pos: [x, y, z] position of object to pick
+        bin_pos: [x, y, z] position of bin center
+        base_keyframes: Base keyframe configurations to adapt
+        
+    Returns:
+        Dictionary of adapted keyframes
+    """
+    # For now, just return the base keyframes
+    # In the future, we can add adaptive IK to adjust for object positions
+    # while maintaining the proven joint space trajectories as a fallback
+    return base_keyframes.copy()
+
+
 __all__ = [
     "ActuatedJointInfo",
     "JointVelocityController",
     "JointVelocityControllerConfig",
     "KinematicsHelper",
+    "KeyframeController",
+    "compute_pick_place_keyframes",
     "infer_actuated_joints",
 ]
+
+# Export quaternion utilities for orientation control
+def quat_to_axis_angle(quat: np.ndarray) -> np.ndarray:
+    """Convert quaternion to axis-angle representation."""
+    return _quat_to_axis_angle(quat)
+
+def quat_multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Multiply two quaternions."""
+    return _quat_multiply(a, b)
+
+def quat_conjugate(quat: np.ndarray) -> np.ndarray:
+    """Compute quaternion conjugate."""
+    return _quat_conjugate(quat)

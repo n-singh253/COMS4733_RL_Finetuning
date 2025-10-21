@@ -6,3 +6,9 @@ __pycache__/
 
 # Environment variables file
 .env
+
+#Mujuco Menagerie
+mujoco_menagerie/
+
+#dataset
+dataset/
