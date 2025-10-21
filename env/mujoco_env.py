@@ -283,16 +283,42 @@ class FrankaPickPlaceEnv:
     def _randomize_objects(self) -> Tuple[str, ...]:
         count = int(self.rng.integers(3, len(_OBJECT_COLORS) + 1))
         active = tuple(self.rng.choice(_OBJECT_COLORS, size=count, replace=False))
+        
+        # Track placed ball positions to prevent overlap
+        placed_positions = []
+        min_separation = 0.07  # 7cm minimum distance (ball diameter ~6cm + 1cm buffer)
+        
         for color in _OBJECT_COLORS:
             addr = self._object_qpos_addrs[color]
             if color in active:
                 # Place objects in the working zone (0.45-0.55m forward, ±0.25m lateral)
                 # This range has proven successful grasping with our keyframes
-                x = self.rng.uniform(0.45, 0.55)
-                y = self.rng.uniform(-0.25, 0.25)
-                pos = np.array([x, y, 0.035], dtype=np.float64)
-                quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-                self._set_free_joint_pose(addr, pos, quat)
+                # Try up to 50 times to find a non-overlapping position
+                for attempt in range(50):
+                    x = self.rng.uniform(0.45, 0.55)
+                    y = self.rng.uniform(-0.25, 0.25)
+                    pos = np.array([x, y, 0.035], dtype=np.float64)
+                    
+                    # Check if this position overlaps with any existing balls
+                    overlap = False
+                    for existing_pos in placed_positions:
+                        dist = np.linalg.norm(pos[:2] - existing_pos[:2])
+                        if dist < min_separation:
+                            overlap = True
+                            break
+                    
+                    if not overlap:
+                        # Valid position found
+                        quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+                        self._set_free_joint_pose(addr, pos, quat)
+                        placed_positions.append(pos)
+                        break
+                else:
+                    # Fallback: If we can't find non-overlapping position after 50 tries,
+                    # place it anyway (rare edge case)
+                    quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+                    self._set_free_joint_pose(addr, pos, quat)
+                    placed_positions.append(pos)
             else:
                 self._set_free_joint_pose(addr, _HIDDEN_POSE[:3], _HIDDEN_POSE[3:])
         return active
@@ -302,15 +328,19 @@ class FrankaPickPlaceEnv:
         self.model.light_ambient[self._light_id] = np.array([0.4, 0.4, 0.4])
         self.model.light_diffuse[self._light_id] = np.array([0.6, 0.6, 0.6])
 
-        if not self._hindered:
-            self._set_free_joint_pose(self._occluder_qpos_addr, _HIDDEN_POSE[:3], _HIDDEN_POSE[3:])
-            return
-
-        self.model.light_diffuse[self._light_id] = self.rng.uniform(0.2, 0.9, size=3)
-        xy = self.rng.uniform(-self.workspace_extent * 0.5, self.workspace_extent * 0.5)
-        pos = np.array([0.5 + xy[0], xy[1], 0.18], dtype=np.float64)
-        quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-        self._set_free_joint_pose(self._occluder_qpos_addr, pos, quat)
+        # Always hide the occluder cube (optimization: no distracting objects)
+        self._set_free_joint_pose(self._occluder_qpos_addr, _HIDDEN_POSE[:3], _HIDDEN_POSE[3:])
+        
+        # Note: 'hindered' flag is still tracked for dataset labels, but no visual changes
+        # if not self._hindered:
+        #     self._set_free_joint_pose(self._occluder_qpos_addr, _HIDDEN_POSE[:3], _HIDDEN_POSE[3:])
+        #     return
+        # 
+        # self.model.light_diffuse[self._light_id] = self.rng.uniform(0.2, 0.9, size=3)
+        # xy = self.rng.uniform(-self.workspace_extent * 0.5, self.workspace_extent * 0.5)
+        # pos = np.array([0.5 + xy[0], xy[1], 0.18], dtype=np.float64)
+        # quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        # self._set_free_joint_pose(self._occluder_qpos_addr, pos, quat)
 
     # ------------------------------------------------------------------
     # Safety helpers
