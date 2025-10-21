@@ -35,9 +35,14 @@ def _temporal_alignment(proprio: np.ndarray, actions: np.ndarray, timestamps: np
     else:
         dt_hint = dt
 
-    forward_pred = proprio[:-1] + actions[:-1] * dt
+    # Extract only arm joint actions (first 7 dimensions) for temporal alignment
+    # Actions are 8D: [7 joint positions + 1 gripper position]
+    # Proprio is 7D: [7 joint positions]
+    arm_actions = actions[:, :7] if actions.ndim > 1 and actions.shape[1] > 7 else actions
+    
+    forward_pred = proprio[:-1] + arm_actions[:-1] * dt
     forward_mse = float(np.mean((forward_pred - proprio[1:]) ** 2))
-    backward_pred = proprio[1:] - actions[1:] * dt
+    backward_pred = proprio[1:] - arm_actions[1:] * dt
     backward_mse = float(np.mean((backward_pred - proprio[:-1]) ** 2))
 
     if forward_mse <= backward_mse:
@@ -67,6 +72,12 @@ def load_episode(episode_dir: Path) -> Dict[str, object]:
         raise ValueError(f"Non-finite values detected in proprio for {episode_dir.name}")
     if not np.all(np.isfinite(actions)):
         raise ValueError(f"Non-finite values detected in actions for {episode_dir.name}")
+    
+    # Validate dimensions: proprio is 7D (joint positions), actions is 8D (7 joints + gripper)
+    if proprio.ndim != 2 or proprio.shape[1] != 7:
+        raise ValueError(f"Expected proprio shape (N, 7), got {proprio.shape} in {episode_dir.name}")
+    if actions.ndim != 2 or actions.shape[1] != 8:
+        raise ValueError(f"Expected actions shape (N, 8), got {actions.shape} in {episode_dir.name}")
 
     instruction = (episode_dir / "instruction.txt").read_text().strip()
     meta = json.loads((episode_dir / "meta.json").read_text())
