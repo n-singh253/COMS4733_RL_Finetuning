@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Number of episodes to run when --mode is specified.",
     )
+    parser.add_argument(
+        "--no-render",
+        action="store_true",
+        help="Disable GUI rendering for faster evaluation.",
+    )
     return parser.parse_args()
 
 
@@ -58,6 +63,18 @@ def main() -> None:
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     if "config" in checkpoint:
         model_cfg = checkpoint["config"]
+    
+    # Load action statistics for denormalization
+    action_stats = checkpoint.get("action_stats", None)
+    if action_stats is None:
+        logger.warning("Action statistics not found in checkpoint. Actions will not be denormalized.")
+    else:
+        logger.info("Loaded action statistics from checkpoint for denormalization.")
+    
+    # Check if model was trained with BCE (using logits) for gripper
+    uses_bce_gripper = checkpoint.get("uses_bce_gripper", False)
+    if uses_bce_gripper:
+        logger.info("Model trained with BCE for gripper - will apply sigmoid to gripper output.")
 
     model_config = VLADinoV2Config(**model_cfg)
     policy = VLADinoV2Policy(model_config)
@@ -67,12 +84,15 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     policy.to(device)
 
-    image_processor = AutoImageProcessor.from_pretrained(model_config.vision_encoder)
+    # Use fast processor and disable rescaling (images already in [0,1] range from environment)
+    image_processor = AutoImageProcessor.from_pretrained(model_config.vision_encoder, use_fast=True, do_rescale=False)
 
     asset_root = evaluation_cfg.get("asset_root", "./env/mujoco_assets")
+    # Disable rendering if --no-render flag is set, otherwise use config setting
+    enable_gui = evaluation_cfg.get("render", False) and not args.no_render
     env = FrankaPickPlaceEnv(
         asset_root=asset_root,
-        gui=evaluation_cfg.get("render", False),
+        gui=enable_gui,
         seed=evaluation_cfg.get("seed", 0),
     )
 
@@ -93,6 +113,8 @@ def main() -> None:
                 device,
                 episodes,
                 mode=selected_mode,
+                action_stats=action_stats,
+                uses_bce_gripper=uses_bce_gripper,
             )
             save_results(results_dir / f"{selected_mode}_eval.csv", results)
             if selected_mode == "static":
@@ -111,6 +133,8 @@ def main() -> None:
             device,
             episodes_static,
             mode="static",
+            action_stats=action_stats,
+            uses_bce_gripper=uses_bce_gripper,
         )
         hindered_results, hindered_rate = run_rollouts(
             env,
@@ -119,6 +143,8 @@ def main() -> None:
             device,
             episodes_hindered,
             mode="hindered",
+            action_stats=action_stats,
+            uses_bce_gripper=uses_bce_gripper,
         )
 
         save_results(results_dir / "static_eval.csv", static_results)
@@ -140,6 +166,8 @@ def run_rollouts(
     device: torch.device,
     episodes: int,
     mode: str,
+    action_stats: Dict[str, List[float]] | None = None,
+    uses_bce_gripper: bool = False,
 ) -> Tuple[List[Dict[str, float]], float | None]:
     logger = get_logger("evaluate_bc")
     results: List[Dict[str, float]] = []
@@ -149,17 +177,82 @@ def run_rollouts(
         done = False
         total_reward = 0.0
         success = False
+        step = 0
+        # Use the actual instruction from environment (e.g., "Pick up the blue sphere...")
+        instruction_text = info.get("instruction", "Pick up the sphere and place it in the goal bin.")
+        
+        # Initialize action history buffer for closed-loop control
+        history_length = policy.config.history_length
+        action_dim = policy.config.action_dim
+        action_history = torch.zeros((history_length, action_dim), dtype=torch.float32, device=device)
 
         while not done:
-            rgb_tensor, proprio_tensor = preprocess_observation(observation, image_processor, device)
+            step += 1
+            # Pass timestep for temporal awareness (helps model learn "close at ~step 120, open at ~step 320")
+            rgb_tensor, proprio_tensor = preprocess_observation(observation, image_processor, device, timestep=step, max_steps=340)
             with torch.no_grad():
-                instructions = ["perform the task"] * rgb_tensor.size(0)
-                action = policy(rgb_static=rgb_tensor, proprio=proprio_tensor, instruction=instructions).cpu().numpy()
+                instructions = [instruction_text] * rgb_tensor.size(0)
+                # Pass action history for closed-loop control
+                action = policy(
+                    rgb_static=rgb_tensor, 
+                    proprio=proprio_tensor, 
+                    instruction=instructions,
+                    action_history=action_history.unsqueeze(0)  # Add batch dimension: (1, H, D)
+                ).cpu().numpy()
+            
+            # Denormalize action if statistics are available
+            if action_stats is not None:
+                action_mean = np.array(action_stats["mean"], dtype=np.float32)
+                action_std = np.array(action_stats["std"], dtype=np.float32)
+                # Denormalize ALL dimensions including gripper
+                # Must match training normalization (all 8 dims normalized)
+                action[0] = action[0] * action_std + action_mean
+            
+            # Handle gripper based on training method
+            if uses_bce_gripper:
+                # Model trained with BCE: output is logit
+                # Use CRISP BINARY threshold in logit space (more stable than sigmoid)
+                gripper_logit = action[0, 7]
+                
+                # Threshold tuning guide:
+                # logit >  0.0  → prob > 0.50 (neutral, sigmoid threshold)
+                # logit > -0.4  → prob > 0.40 (easier to open, conservative)
+                # logit > -0.8  → prob > 0.31 (very easy to open)
+                # logit >  0.5  → prob > 0.62 (harder to open, more selective)
+                
+                GRIPPER_LOGIT_THRESHOLD = -0.4  # Try -0.4 first (prob ≈ 0.40)
+                
+                # Crisp binary decision - no continuous values
+                if gripper_logit > GRIPPER_LOGIT_THRESHOLD:
+                    action[0, 7] = 0.04  # Open
+                else:
+                    action[0, 7] = 0.0   # Closed
+            else:
+                # Model trained with MSE: round to binary states
+                action[0, 7] = 0.0 if action[0, 7] < 0.02 else 0.04
+            
+            # Removed verbose step-by-step logging for faster evaluation
+            # (Was logging every 20 steps, now only episode-level results)
+            
             step_result = env.step(action.squeeze(0))
             observation = step_result.observation
             total_reward += float(step_result.reward)
             done = bool(step_result.terminated or step_result.truncated)
             success = bool(step_result.info.get("success", success))
+            
+            # Update action history buffer (shift and append for next timestep)
+            # This enables closed-loop control by letting model see its recent actions
+            action_normalized = torch.from_numpy(action[0]).float().to(device)
+            if action_stats is not None:
+                # Re-normalize the action for history (model expects normalized actions)
+                action_mean_tensor = torch.from_numpy(action_mean).float().to(device)
+                action_std_tensor = torch.from_numpy(action_std).float().to(device)
+                action_normalized = (action_normalized - action_mean_tensor) / (action_std_tensor + 1e-8)
+            action_history = torch.cat([action_history[1:], action_normalized.unsqueeze(0)], dim=0)
+            
+            # Sync viewer for GUI visualization (if enabled)
+            if hasattr(env, 'viewer') and env.viewer is not None:
+                env.viewer.sync()
 
         results.append({"episode": episode, "success": float(success), "reward": total_reward})
 
@@ -170,10 +263,24 @@ def run_rollouts(
     return results, success_rate
 
 
-def preprocess_observation(observation, image_processor, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+def preprocess_observation(observation, image_processor, device: torch.device, timestep: int = 0, max_steps: int = 340) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Preprocess observation for model input.
+    
+    Args:
+        observation: Dict with 'rgb_static' and 'proprio' keys
+        image_processor: HuggingFace image processor
+        device: torch device
+        timestep: Current timestep in episode (for temporal awareness)
+        max_steps: Maximum episode length for timestep normalization (must match training: 340)
+    
+    Returns:
+        rgb_tensor: Preprocessed RGB image
+        proprio_tensor: Proprio + timestep concatenated (8-dim)
+    """
     if isinstance(observation, dict):
-        rgb = observation.get("rgb_static") or observation.get("image")
-        proprio = observation.get("proprio") or observation.get("robot_qpos")
+        # Use explicit key checking to avoid numpy array ambiguity with 'or' operator
+        rgb = observation.get("rgb_static") if "rgb_static" in observation else observation.get("image")
+        proprio = observation.get("proprio") if "proprio" in observation else observation.get("robot_qpos")
     else:
         raise ValueError("Observation must be a dictionary containing rgb_static/image and proprio data")
 
@@ -194,11 +301,12 @@ def preprocess_observation(observation, image_processor, device: torch.device) -
         if rgb_array.max() > 1.0:
             rgb_array = rgb_array / 255.0
 
-    inputs = image_processor(images=rgb_array, return_tensors="pt")
+    # Images already in [0,1] range - disable rescaling
+    inputs = image_processor(images=rgb_array, return_tensors="pt", do_rescale=False)
     rgb_tensor = inputs["pixel_values"].to(device)
 
     if proprio is None:
-        proprio_tensor = torch.zeros(1, 7, device=device)
+        proprio_tensor = torch.zeros(1, 8, device=device)  # 7 joints + 1 timestep
     else:
         if isinstance(proprio, torch.Tensor):
             proprio_tensor = proprio.float().to(device).unsqueeze(0)
@@ -207,8 +315,31 @@ def preprocess_observation(observation, image_processor, device: torch.device) -
             proprio_tensor = torch.from_numpy(proprio_array).float().to(device).unsqueeze(0)
         if proprio_tensor.ndim == 1:
             proprio_tensor = proprio_tensor.unsqueeze(0)
+        
+        # Normalize proprio to [-1, 1] using fixed joint limits (Franka Panda: ±2.8973 rad)
+        # This ensures consistent normalization across all observations
+        joint_min = -2.8973
+        joint_max = 2.8973
+        proprio_tensor = 2.0 * (proprio_tensor - joint_min) / (joint_max - joint_min) - 1.0
+    
+    # Add normalized timestep as 8th dimension (for temporal awareness)
+    timestep_normalized = timestep / max(max_steps, 1)  # Normalize to [0, 1]
+    timestep_tensor = torch.tensor([[timestep_normalized]], dtype=torch.float32, device=device)
+    
+    # Concatenate: (1, 7) + (1, 1) → (1, 8)
+    proprio_tensor = torch.cat([proprio_tensor, timestep_tensor], dim=-1)
 
     return rgb_tensor, proprio_tensor
+
+
+def _normalize_range(tensor: torch.Tensor, low: float, high: float) -> torch.Tensor:
+    """Normalize tensor to [low, high] range to match training preprocessing."""
+    minimum = tensor.min()
+    maximum = tensor.max()
+    if maximum == minimum:
+        return torch.zeros_like(tensor)
+    scaled = (tensor - minimum) / (maximum - minimum)
+    return scaled * (high - low) + low
 
 
 def save_results(path: Path, rows: Iterable[Dict[str, float]]) -> None:

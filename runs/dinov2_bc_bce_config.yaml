@@ -17,7 +17,6 @@ model:
   freeze_vision: false
   freeze_language: false
   dropout: 0.05
-  history_length: 5
 training:
   epochs: 35
   lr: 0.0001

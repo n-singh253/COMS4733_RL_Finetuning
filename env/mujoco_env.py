@@ -368,8 +368,14 @@ class FrankaPickPlaceEnv:
     # ------------------------------------------------------------------
     def render(self, mode: str = "rgb_array") -> np.ndarray:
         if mode == "rgb_array":
-            self.renderer.update_scene(self.data, camera=self.camera_name)
-            rgb = self.renderer.render()
+            # Create fresh renderer each frame (MuJoCo 3.1.6)
+            renderer = mujoco.Renderer(self.model, height=self.height, width=self.width)
+            
+            # CRITICAL: Don't pass camera parameter to update_scene - it causes frozen images!
+            # Just use default camera (first camera in model, which is 'top')
+            renderer.update_scene(self.data)
+            rgb = renderer.render()
+            
             # Convert from uint8 [0, 255] to float32 [0, 1]
             return (rgb / 255.0).astype(np.float32)
         if mode == "human":  # pragma: no cover - viewer only

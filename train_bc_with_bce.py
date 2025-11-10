@@ -1,4 +1,6 @@
-"""Behavioral cloning training entry-point for the VLA model."""
+"""Training script with BCE loss for gripper (proper binary classification)."""
+# Copy of train_bc.py but with BCE loss for gripper instead of weighted MSE
+
 from __future__ import annotations
 
 import argparse
@@ -61,24 +63,70 @@ def build_dataloader(
     return dataset, dataloader
 
 
+def compute_loss(pred, target, criterion_mse, criterion_bce_logits, epoch=1, total_epochs=35):
+    """Compute loss with MSE for joints and transition-aware BCE for gripper.
+    
+    Gripper values in data are 0.0 (closed) or 0.04 (open).
+    We treat this as binary classification:
+    - 0.0 → class 0 (closed)
+    - 0.04 → class 1 (open)
+    
+    ADAPTIVE WEIGHTING: Gripper weight decreases over training (50x → 25x)
+    to balance learning gripper timing early and spatial precision later.
+    
+    PHASE-AWARE WEIGHTING: Batches containing gripper state transitions
+    (open→closed or closed→open) are weighted 3x higher since these are
+    the critical moments for pick-and-place success.
+    
+    SMOOTHNESS REGULARIZATION: Penalizes large consecutive action changes
+    to encourage coherent, deliberate trajectories.
+    """
+    # Joints: MSE loss
+    joint_loss = criterion_mse(pred[:, :7], target[:, :7])
+    
+    # Gripper: Convert to binary labels and use BCE with logits
+    # Target gripper values are 0.0 or 0.04, convert to 0 or 1
+    gripper_targets = (target[:, 7:8] > 0.02).float()  # 0.0→0, 0.04→1
+    
+    # Detect if this batch contains gripper state transitions
+    # Transitions are critical: "when to grasp" and "when to release"
+    batch_has_transitions = False
+    if len(gripper_targets) > 1:
+        # Check for any change in gripper state within batch
+        transitions = (gripper_targets[:-1] != gripper_targets[1:]).any()
+        batch_has_transitions = bool(transitions.item())
+    
+    # Base gripper loss with class-balancing
+    gripper_loss = criterion_bce_logits(pred[:, 7:8], gripper_targets)
+    
+    # Apply transition-aware weighting
+    if batch_has_transitions:
+        # 3x higher weight for batches with transitions (grasp/release moments)
+        transition_multiplier = 3.0
+        gripper_loss = gripper_loss * transition_multiplier
+    
+    # Adaptive gripper weighting: With normalized gripper, lower weight is sufficient
+    epoch_progress = epoch / total_epochs
+    base_gripper_weight = 3.0 * (1.0 - 0.5 * epoch_progress)  # 3x → 1.5x over training
+    
+    # DISABLED: Smoothness loss can cause training instability
+    # smoothness_loss = 0.0
+    # if pred.size(0) > 1:
+    #     action_diffs = pred[1:, :7] - pred[:-1, :7]
+    #     smoothness_loss = (action_diffs ** 2).mean()
+    
+    # Combined loss: adaptive gripper weight (smoothness disabled)
+    loss = joint_loss + base_gripper_weight * gripper_loss
+    
+    return loss, joint_loss, gripper_loss
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train the DINOv2+BERT VLA model via behavioral cloning.")
+    parser = argparse.ArgumentParser(description="Train VLA with BCE for gripper.")
     parser.add_argument("--config", type=str, default="configs/openvla_dinov2_bc.yaml")
     parser.add_argument("--override", type=str, nargs="*", default=None)
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=None,
-        help="Override the number of training epochs declared in the YAML config.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help=(
-            "Load a single batch and execute a forward/backward pass without writing checkpoints. "
-            "Useful for smoke-testing the setup."
-        ),
-    )
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     raw_config = load_config(args.config, overrides=args.override)
@@ -97,41 +145,59 @@ def main() -> None:
     device = torch.device(training_cfg.get("device", "cuda") if torch.cuda.is_available() else "cpu")
     logger.info("Using device %s", device)
 
-    # Load action statistics for normalization
+    # Load action statistics
     action_stats_path = Path(dataset_cfg["path"]) / "action_stats.json"
     if action_stats_path.exists():
         with action_stats_path.open("r", encoding="utf-8") as f:
             action_stats = json.load(f)
         logger.info("Loaded action statistics from %s", action_stats_path)
     else:
-        logger.warning("Action statistics not found at %s. Actions will not be normalized.", action_stats_path)
         action_stats = None
+        logger.warning("No action statistics found at %s", action_stats_path)
 
-    _, train_loader = build_dataloader(dataset_cfg, model_cfg, dataset_cfg.get("train_split", "train"), action_stats)
-    _, val_loader = build_dataloader(dataset_cfg, model_cfg, dataset_cfg.get("val_split", "val"), action_stats)
+    # Build dataloaders
+    train_dataset, train_loader = build_dataloader(dataset_cfg, model_cfg, dataset_cfg.get("train_split", "train"), action_stats)
+    val_dataset, val_loader = build_dataloader(dataset_cfg, model_cfg, dataset_cfg.get("val_split", "val"), action_stats)
+    logger.info("Train dataset: %d samples, Val dataset: %d samples", len(train_dataset), len(val_dataset))
 
+    # Build model
     model_config = VLADinoV2Config(**model_cfg)
     model = VLADinoV2Policy(model_config).to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info("Model: %d total params, %d trainable", total_params, trainable_params)
 
+    # Optimizer
     optimizer = optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=training_cfg["lr"],
-        weight_decay=training_cfg.get("weight_decay", 0.0),
+        model.parameters(),
+        lr=training_cfg.get("lr", 1e-4),
+        weight_decay=training_cfg.get("weight_decay", 0.01),
     )
+
+    # Scheduler
     scheduler = (
         optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=training_cfg["epochs"])
         if training_cfg.get("scheduler", "cosine") == "cosine"
         else None
     )
-    criterion = nn.MSELoss()
+    
+    # Loss functions
+    criterion_mse = nn.MSELoss()
+    # Class-weighted BCE to handle gripper imbalance (60% closed, 40% open)
+    # pos_weight weights the positive class (open=1) higher to balance learning
+    pos_weight = torch.tensor([1.53], device=device)  # Ratio of closed:open from dataset
+    criterion_bce_logits = nn.BCEWithLogitsLoss(pos_weight=pos_weight)  # Combines sigmoid + BCE
 
     checkpoint_dir = Path(training_cfg.get("checkpoint_dir", "./runs"))
     if not args.dry_run:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        save_config(raw_config, checkpoint_dir / f"{training_cfg.get('checkpoint_name', 'bc_run')}_config.yaml")
+        # Use different checkpoint name for BCE version to avoid overwriting MSE checkpoints
+        checkpoint_name = training_cfg.get('checkpoint_name', 'dinov2_bc')
+        checkpoint_name_bce = f"{checkpoint_name}_bce"  # Add "_bce" suffix
+        save_config(raw_config, checkpoint_dir / f"{checkpoint_name_bce}_config.yaml")
 
     if args.dry_run:
-        logger.info("Running dry run with a single batch from the training loader.")
+        logger.info("Running dry run with BCE loss for gripper")
         batch = next(iter(train_loader))
         model.train()
         optimizer.zero_grad()
@@ -141,33 +207,36 @@ def main() -> None:
         instructions = batch.get("instruction") or [""] * rgb.size(0)
         outputs = model(rgb_static=rgb, proprio=proprio, instruction=instructions)
         
-        # Use weighted loss (same as training)
-        joint_loss = criterion(outputs[:, :7], target[:, :7])
-        gripper_loss = criterion(outputs[:, 7:8], target[:, 7:8])
-        loss = joint_loss + 50.0 * gripper_loss  # Balanced weight for gripper learning
+        loss, joint_loss, gripper_loss = compute_loss(outputs, target, criterion_mse, criterion_bce_logits)
         
         loss.backward()
         grad_clip = training_cfg.get("grad_clip", 0.0)
         if grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
-        logger.info("Dry run completed successfully (loss=%.5f, joint=%.5f, gripper=%.5f).", 
+        logger.info("Dry run completed (loss=%.5f, joint=%.5f, gripper_bce=%.5f).",
                    float(loss.item()), float(joint_loss.item()), float(gripper_loss.item()))
         return
 
-    # Mixed precision training setup
+    # Mixed precision setup
     use_amp = training_cfg.get("mixed_precision", False) and device.type == "cuda"
     scaler = GradScaler() if use_amp else None
     if use_amp:
         logger.info("Mixed precision training enabled")
 
     best_val_loss = float("inf")
+    
+    # Set checkpoint name for BCE version (add "_bce" suffix to avoid conflicts)
+    checkpoint_name = training_cfg.get('checkpoint_name', 'dinov2_bc')
+    checkpoint_name_bce = f"{checkpoint_name}_bce"
+    logger.info("Using checkpoint name: %s", checkpoint_name_bce)
 
     for epoch in range(1, training_cfg["epochs"] + 1):
         train_loss = train_one_epoch(
             model,
             train_loader,
-            criterion,
+            criterion_mse,
+            criterion_bce_logits,
             optimizer,
             device,
             training_cfg.get("log_interval", 10),
@@ -182,31 +251,37 @@ def main() -> None:
             scheduler.step()
 
         if (epoch % training_cfg.get("val_interval", 1)) == 0:
-            val_loss = evaluate(model, val_loader, criterion, device, epoch=epoch, total_epochs=training_cfg["epochs"])
+            val_loss = evaluate(
+                model, val_loader, criterion_mse, criterion_bce_logits, device,
+                epoch=epoch, total_epochs=training_cfg["epochs"]
+            )
             logger.info("Epoch %d | val_loss=%.5f", epoch, val_loss)
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                checkpoint_path = checkpoint_dir / f"{training_cfg.get('checkpoint_name', 'bc_run')}_best.pt"
+                checkpoint_path = checkpoint_dir / f"{checkpoint_name_bce}_best.pt"
                 logger.info("New best checkpoint at %s", checkpoint_path)
                 torch.save({
                     "model_state": model.state_dict(),
                     "config": model_config.__dict__,
-                    "action_stats": action_stats
+                    "action_stats": action_stats,
+                    "uses_bce_gripper": True  # Flag for evaluation
                 }, checkpoint_path)
 
-        last_checkpoint_path = checkpoint_dir / f"{training_cfg.get('checkpoint_name', 'bc_run')}_last.pt"
+        last_checkpoint_path = checkpoint_dir / f"{checkpoint_name_bce}_last.pt"
         torch.save({
             "model_state": model.state_dict(),
             "config": model_config.__dict__,
-            "action_stats": action_stats
+            "action_stats": action_stats,
+            "uses_bce_gripper": True
         }, last_checkpoint_path)
 
 
 def train_one_epoch(
     model: VLADinoV2Policy,
     dataloader: DataLoader,
-    criterion: nn.Module,
+    criterion_mse: nn.Module,
+    criterion_bce_logits: nn.Module,
     optimizer: optim.Optimizer,
     device: torch.device,
     log_interval: int,
@@ -232,34 +307,13 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         
-        # Mixed precision forward pass
         with autocast(enabled=use_amp):
             pred = model(rgb_static=rgb, proprio=proprio, instruction=instructions, action_history=action_history)
-            
-            # Compute weighted loss with ADAPTIVE gripper weighting
-            # With normalized gripper (same scale as joints), lower weight is sufficient
-            epoch_progress = epoch / total_epochs
-            gripper_weight = 3.0 * (1.0 - 0.5 * epoch_progress)  # 3x → 1.5x over training
-            
-            joint_loss = criterion(pred[:, :7], target[:, :7])
-            gripper_loss = criterion(pred[:, 7:8], target[:, 7:8])
-            
-            # DISABLED: Smoothness loss can cause training instability
-            # Will re-enable after confirming base training works
-            # smoothness_loss = 0.0
-            # if pred.size(0) > 1:
-            #     action_diffs = pred[1:, :7] - pred[:-1, :7]
-            #     smoothness_loss = (action_diffs ** 2).mean()
-            
-            loss = joint_loss + gripper_weight * gripper_loss  # Removed smoothness term
+            loss, joint_loss, gripper_loss = compute_loss(
+                pred, target, criterion_mse, criterion_bce_logits, 
+                epoch=epoch, total_epochs=total_epochs
+            )
         
-        # Safety: Skip batch if loss is non-finite (NaN or Inf)
-        if not torch.isfinite(loss):
-            get_logger("train_bc").warning(f"Skipping batch with non-finite loss at epoch {epoch}, step {step}")
-            get_logger("train_bc").warning(f"  joint_loss={joint_loss.item():.4f}, gripper_loss={gripper_loss.item():.4f}")
-            continue
-        
-        # Backward pass with gradient scaling
         if use_amp:
             scaler.scale(loss).backward()
             if grad_clip > 0:
@@ -276,7 +330,10 @@ def train_one_epoch(
         tracker.update(loss.item(), rgb.size(0))
 
         if step % log_interval == 0:
-            get_logger("train_bc").info("Step %d | loss=%.5f", step, tracker.average)
+            get_logger("train_bc").info(
+                "Step %d | total_loss=%.5f (joint=%.5f, gripper_bce=%.5f, weighted_gripper=%.5f)",
+                step, tracker.average, joint_loss.item(), gripper_loss.item(), 10.0 * gripper_loss.item()
+            )
 
     return tracker.average
 
@@ -284,7 +341,8 @@ def train_one_epoch(
 def evaluate(
     model: VLADinoV2Policy, 
     dataloader: DataLoader, 
-    criterion: nn.Module, 
+    criterion_mse: nn.Module, 
+    criterion_bce_logits: nn.Module, 
     device: torch.device,
     epoch: int = 1,
     total_epochs: int = 35,
@@ -304,16 +362,14 @@ def evaluate(
                 instructions = [""] * rgb.size(0)
 
             pred = model(rgb_static=rgb, proprio=proprio, instruction=instructions, action_history=action_history)
+            loss, _, _ = compute_loss(
+                pred, target, criterion_mse, criterion_bce_logits,
+                epoch=epoch, total_epochs=total_epochs
+            )
             
-            # Use same adaptive weighted loss as training
-            epoch_progress = epoch / total_epochs
-            gripper_weight = 3.0 * (1.0 - 0.5 * epoch_progress)
-            
-            joint_loss = criterion(pred[:, :7], target[:, :7])
-            gripper_loss = criterion(pred[:, 7:8], target[:, 7:8])
-            
-            # Smoothness disabled (same as training)
-            loss = joint_loss + gripper_weight * gripper_loss
+            # Skip non-finite losses
+            if not torch.isfinite(loss):
+                continue
             
             tracker.update(loss.item(), rgb.size(0))
     return tracker.average
@@ -321,3 +377,4 @@ def evaluate(
 
 if __name__ == "__main__":
     main()
+

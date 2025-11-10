@@ -257,17 +257,19 @@ def keyframe_policy(
     current_q = env.data.qpos[env._joint_qpos_indices].copy()
     current_qvel = env.data.qvel[env._joint_dof_indices].copy()
     
-    # Adaptive dwell time: longer for critical grasp phases
+    # DENSE DEMOS: Minimal dwell times for smooth, motion-rich trajectories
+    # Reduced from sparse keyframe holds (50-70 steps) to 8-15 steps
+    # This provides 4-5x more action diversity while maintaining physics stability
     if keyframe_name == "grasp":
-        required_dwell = 50  # Extra time to fully settle before closing
+        required_dwell = 10  # Reduced from 50 (5x less hold time)
     elif keyframe_name == "grasp_closed":
-        required_dwell = 70  # Extended time for gripper to fully close and secure grip
+        required_dwell = 15  # Reduced from 70 (4.6x less) - still ensures secure grip
     elif keyframe_name == "lift":
-        required_dwell = 30  # Extra time after closing to ensure firm grip before lifting
+        required_dwell = 8   # Reduced from 30 (3.75x less)
     elif keyframe_name == "transport":
-        required_dwell = 50  # Extra time to stabilize before final move to place (prevents slip)
+        required_dwell = 10  # Reduced from 50 (5x less)
     else:
-        required_dwell = dwell_time
+        required_dwell = max(5, dwell_time // 5)  # General 5x reduction, minimum 5 steps
     
     # Check if we've converged and dwelled long enough
     if steps_at_keyframe >= required_dwell and controller.check_convergence(current_q, current_qvel, target_q):
@@ -430,13 +432,36 @@ def main() -> None:
     dataset_root: Path = args.dataset
     dataset_root.mkdir(parents=True, exist_ok=True)
 
+    # Check for existing episodes to determine starting point
+    existing_episodes = []
+    if dataset_root.exists():
+        existing_episodes = [d for d in dataset_root.iterdir() 
+                           if d.is_dir() and d.name.startswith('episode_')]
+    
+    start_episode = len(existing_episodes)
+    print(f"Found {len(existing_episodes)} existing episodes. Starting from episode {start_episode}")
+    
+    # Load existing metadata if it exists
+    metadata_path = dataset_root / "metadata.json"
+    if metadata_path.exists():
+        with metadata_path.open("r", encoding="utf-8") as handle:
+            existing_metadata = json.load(handle)
+        metadata = existing_metadata.get("episodes", [])
+        print(f"Loaded existing metadata with {len(metadata)} episodes")
+    else:
+        metadata = []
+
     env = FrankaPickPlaceEnv(gui=args.gui, seed=args.seed, asset_root=args.asset_root)
-    metadata: List[Dict[str, object]] = []
 
     rng = np.random.default_rng(args.seed)
     hindered_fraction = float(np.clip(args.hindered_fraction, 0.0, 1.0))
 
-    for episode_idx in range(args.episodes):
+    # Skip random numbers for episodes we've already collected to maintain reproducibility
+    for _ in range(start_episode):
+        rng.random()
+
+    # Continue from where we left off
+    for episode_idx in range(start_episode, args.episodes):
         hindered = rng.random() < hindered_fraction
         buffer = collect_episode(env, hindered=hindered, max_steps=args.max_steps)
         buffer.save(dataset_root, episode_idx)

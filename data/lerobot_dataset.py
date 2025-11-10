@@ -49,6 +49,9 @@ class LeRobotDataset(Dataset):
         image_transform: Optional[Callable[[Image.Image], torch.Tensor]] = None,
         sequence_length: int = 1,
         normalize_proprio: bool = True,
+        normalize_actions: bool = True,
+        action_stats: Optional[Dict[str, List[float]]] = None,
+        history_length: int = 5,
     ) -> None:
         super().__init__()
         self.root = Path(root)
@@ -58,6 +61,9 @@ class LeRobotDataset(Dataset):
         self.image_transform = image_transform
         self.sequence_length = sequence_length
         self.normalize_proprio = normalize_proprio
+        self.normalize_actions = normalize_actions
+        self.action_stats = action_stats
+        self.history_length = history_length
 
         if not self.root.exists():
             raise FileNotFoundError(f"Dataset root does not exist: {self.root}")
@@ -96,12 +102,86 @@ class LeRobotDataset(Dataset):
         if "proprio" in self.modalities:
             proprio = torch.from_numpy(data["proprio"][start_t:end_t]).float()
             if self.normalize_proprio:
-                proprio = _normalize_range(proprio, -1.0, 1.0)
+                # Normalize using fixed joint limits (Franka Panda: ±2.8973 rad)
+                # This ensures consistent normalization across all episodes and timesteps
+                joint_min = -2.8973
+                joint_max = 2.8973
+                proprio = 2.0 * (proprio - joint_min) / (joint_max - joint_min) - 1.0
+            
+            # ADD TIMESTEP as 8th dimension for temporal awareness
+            # Normalize timestep to [0, 1] using FIXED max_steps to match evaluation
+            # CRITICAL: Must use same normalization as evaluate_bc_mujoco.py (max_steps=340)
+            MAX_EPISODE_STEPS = 340  # Fixed constant matching evaluation
+            timesteps = torch.arange(start_t, end_t, dtype=torch.float32) / MAX_EPISODE_STEPS
+            timesteps = timesteps.unsqueeze(-1)  # Shape: (seq_len, 1)
+            
+            # Concatenate: (seq_len, 7) + (seq_len, 1) → (seq_len, 8)
+            proprio = torch.cat([proprio, timesteps], dim=-1)
+            
             sample["proprio"] = proprio if self.sequence_length > 1 else proprio.squeeze(0)
 
         if "action" in self.modalities:
             action = torch.from_numpy(data["actions"][start_t:end_t]).float()
+            
+            # Enable interpolation to generate smooth trajectories from keyframe demos
+            # This converts keyframe holds into smooth motions between waypoints
+            if self.sequence_length == 1 and start_t > 0 and start_t < len(data["actions"]) - 1:
+                # Get previous and next actions
+                prev_action = torch.from_numpy(data["actions"][start_t - 1]).float()
+                next_action = torch.from_numpy(data["actions"][min(start_t + 1, len(data["actions"]) - 1)]).float()
+                
+                # Check if current action is same as previous (keyframe hold)
+                is_holding = torch.allclose(action[0, :7], prev_action[:7], atol=1e-4)
+                
+                if is_holding:
+                    # Find the next different action (end of keyframe hold)
+                    keyframe_end = start_t + 1
+                    while keyframe_end < len(data["actions"]):
+                        if not torch.allclose(
+                            torch.from_numpy(data["actions"][keyframe_end]).float()[:7],
+                            action[0, :7],
+                            atol=1e-4
+                        ):
+                            break
+                        keyframe_end += 1
+                    
+                    if keyframe_end < len(data["actions"]):
+                        # Interpolate between current keyframe and next keyframe
+                        next_keyframe = torch.from_numpy(data["actions"][keyframe_end]).float()
+                        keyframe_duration = keyframe_end - start_t
+                        
+                        # Linear interpolation for joints (dims 0-6)
+                        alpha = min(1.0 / keyframe_duration, 1.0)  # Interpolation factor
+                        action[0, :7] = action[0, :7] * (1 - alpha) + next_keyframe[:7] * alpha
+                        # Keep gripper as-is (binary control)
+            
+            if self.normalize_actions and self.action_stats is not None:
+                # Normalize actions using dataset statistics
+                action_mean = torch.tensor(self.action_stats["mean"], dtype=torch.float32)
+                action_std = torch.tensor(self.action_stats["std"], dtype=torch.float32)
+                # Normalize ALL dimensions including gripper for consistent scale
+                # This prevents scale mismatch between normalized joints (range ~[-3,+3]) 
+                # and raw gripper (range [0.0,0.04]) which causes gradient instability
+                action = (action - action_mean) / (action_std + 1e-8)
             sample["action"] = action if self.sequence_length > 1 else action.squeeze(0)
+            
+            # Add action history for temporal context (closed-loop control)
+            if self.history_length > 0:
+                # Get history window [start_t - history_length, start_t)
+                history_start = max(0, start_t - self.history_length)
+                action_history = torch.from_numpy(data["actions"][history_start:start_t]).float()
+                
+                # Pad with zeros if at episode start (insufficient history)
+                if len(action_history) < self.history_length:
+                    padding_size = self.history_length - len(action_history)
+                    padding = torch.zeros((padding_size, data["actions"].shape[1]), dtype=torch.float32)
+                    action_history = torch.cat([padding, action_history], dim=0)
+                
+                # Normalize history with same stats as current action
+                if self.normalize_actions and self.action_stats is not None:
+                    action_history = (action_history - action_mean) / (action_std + 1e-8)
+                
+                sample["action_history"] = action_history
 
         if "instruction" in self.modalities:
             sample["instruction"] = episode.instruction
@@ -126,6 +206,8 @@ class LeRobotDataset(Dataset):
                 batch_tensors.setdefault("proprio", []).append(item["proprio"])  # type: ignore[arg-type]
             if "action" in item:
                 batch_tensors.setdefault("action", []).append(item["action"])  # type: ignore[arg-type]
+            if "action_history" in item:
+                batch_tensors.setdefault("action_history", []).append(item["action_history"])  # type: ignore[arg-type]
             if "instruction" in item:
                 instructions.append(item["instruction"])  # type: ignore[arg-type]
 

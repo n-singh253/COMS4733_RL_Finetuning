@@ -22,6 +22,7 @@ class VLADinoV2Config:
     freeze_vision: bool = True
     freeze_language: bool = False
     dropout: float = 0.1
+    history_length: int = 5  # Number of past actions to condition on
 
 
 class VLADinoV2Policy(nn.Module):
@@ -47,9 +48,17 @@ class VLADinoV2Policy(nn.Module):
             nn.Linear(language_dim, config.fusion_hidden_dim),
         )
         self.proprio_projection = nn.Sequential(
-            nn.Linear(7, config.fusion_hidden_dim),
+            nn.Linear(8, config.fusion_hidden_dim),  # 7 joints + 1 timestep
             nn.ReLU(),
             nn.Linear(config.fusion_hidden_dim, config.fusion_hidden_dim),
+        )
+        
+        # Action history encoder for temporal context
+        self.action_history_encoder = nn.Sequential(
+            nn.Linear(config.action_dim * config.history_length, 128),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(128, config.fusion_hidden_dim),
         )
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -83,13 +92,15 @@ class VLADinoV2Policy(nn.Module):
         rgb_static: torch.Tensor,
         instruction: List[str],
         proprio: torch.Tensor,
+        action_history: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Predict joint velocities from multimodal inputs.
 
         Args:
             rgb_static: Batch of RGB images ``(B, C, H, W)`` normalized to ``[0, 1]``.
             instruction: Batch of natural-language strings.
-            proprio: Batch of proprioceptive vectors ``(B, 7)``.
+            proprio: Batch of proprioceptive vectors ``(B, 8)`` - 7 joints + 1 timestep.
+            action_history: Batch of past actions ``(B, history_length, action_dim)`` or None.
         """
 
         device = rgb_static.device
@@ -97,7 +108,24 @@ class VLADinoV2Policy(nn.Module):
         text_embedding = self._encode_text(instruction, device=device)
         proprio_embedding = self.proprio_projection(proprio)
 
-        fusion_tokens = torch.stack([image_embedding, text_embedding, proprio_embedding], dim=1)
+        # Encode action history if provided
+        if action_history is not None:
+            # Flatten history: (B, H, D) -> (B, H*D)
+            batch_size = action_history.shape[0]
+            history_flat = action_history.reshape(batch_size, -1)
+            history_embedding = self.action_history_encoder(history_flat)
+            
+            # Fuse all modalities including history
+            fusion_tokens = torch.stack([
+                image_embedding, 
+                text_embedding, 
+                proprio_embedding,
+                history_embedding
+            ], dim=1)
+        else:
+            # Backward compatibility: no history
+            fusion_tokens = torch.stack([image_embedding, text_embedding, proprio_embedding], dim=1)
+        
         fused = self.fusion(fusion_tokens)
         pooled = fused.mean(dim=1)
         return self.head(pooled)

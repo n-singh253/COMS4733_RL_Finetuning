@@ -12,3 +12,9 @@ mujoco_menagerie/
 
 #dataset
 dataset/
+
+#dataset
+dataset_before/
+
+#backups
+backups/
