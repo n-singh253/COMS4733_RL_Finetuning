@@ -1,24 +1,40 @@
-# Placeholder PPO configuration for Milestone 2 fine-tuning.
+# PPO configuration for RL fine-tuning of VLA policy
+# Based on RL4VLA approach and PPO best practices
+
 policy:
+  # Checkpoint from BC pre-training (warmup phase)
   checkpoint: ./runs/dinov2_bc_best.pt
-  learning_rate: 5e-6
-  clip_range: 0.2
-  value_coef: 0.5
-  entropy_coef: 0.01
-  batch_size: 64
-  rollout_length: 2048
-  num_epochs: 10
-  gamma: 0.99
-  gae_lambda: 0.95
+
+  # PPO hyperparameters
+  learning_rate: 3e-6  # Lower LR for fine-tuning pre-trained model
+  clip_range: 0.2  # Standard PPO clip range
+  value_coef: 0.5  # Coefficient for value loss
+  entropy_coef: 0.01  # Entropy bonus for exploration
+  max_grad_norm: 0.5  # Gradient clipping
+  action_std: 0.1  # Standard deviation for Gaussian policy
+  target_kl: 0.01  # Target KL for early stopping
+
+  # Training schedule
+  num_epochs: 100  # Total number of rollout epochs
+  rollout_length: 2048  # Steps to collect per epoch
+  ppo_epochs: 4  # Number of PPO update epochs per rollout
+  batch_size: 64  # Minibatch size for PPO updates
+
+  # Discount and GAE
+  gamma: 0.99  # Discount factor
+  gae_lambda: 0.95  # GAE lambda parameter
+
+  # Device
   device: cuda
+  seed: 42
 
 environment:
+  # Environment configuration
   asset_root: ./env/mujoco_assets
-  reward_type: dense
-  num_envs: 8
-  horizon: 1000
+  reward_type: dense  # Use dense rewards for better learning signal
+  horizon: 400  # Max steps per episode (same as BC training)
 
 logging:
   output_dir: ./runs/ppo
-  checkpoint_interval: 5
-  eval_interval: 10
+  checkpoint_interval: 5  # Save checkpoint every N epochs
+  eval_interval: 10  # Evaluate every N epochs

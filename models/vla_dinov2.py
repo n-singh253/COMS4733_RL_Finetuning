@@ -77,6 +77,12 @@ class VLADinoV2Policy(nn.Module):
             nn.Linear(config.fusion_hidden_dim, config.action_dim),
         )
 
+        # Value head for RL (critic)
+        self.value_head = nn.Sequential(
+            nn.LayerNorm(config.fusion_hidden_dim),
+            nn.Linear(config.fusion_hidden_dim, 1),
+        )
+
         if config.freeze_vision:
             for param in self.vision_encoder.parameters():
                 param.requires_grad = False
@@ -102,7 +108,17 @@ class VLADinoV2Policy(nn.Module):
             proprio: Batch of proprioceptive vectors ``(B, 8)`` - 7 joints + 1 timestep.
             action_history: Batch of past actions ``(B, history_length, action_dim)`` or None.
         """
+        pooled = self._get_fused_features(rgb_static, instruction, proprio, action_history)
+        return self.head(pooled)
 
+    def _get_fused_features(
+        self,
+        rgb_static: torch.Tensor,
+        instruction: List[str],
+        proprio: torch.Tensor,
+        action_history: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Get fused multimodal features for actor and critic."""
         device = rgb_static.device
         image_embedding = self._encode_image(rgb_static)
         text_embedding = self._encode_text(instruction, device=device)
@@ -114,21 +130,112 @@ class VLADinoV2Policy(nn.Module):
             batch_size = action_history.shape[0]
             history_flat = action_history.reshape(batch_size, -1)
             history_embedding = self.action_history_encoder(history_flat)
-            
+
             # Fuse all modalities including history
             fusion_tokens = torch.stack([
-                image_embedding, 
-                text_embedding, 
+                image_embedding,
+                text_embedding,
                 proprio_embedding,
                 history_embedding
             ], dim=1)
         else:
             # Backward compatibility: no history
             fusion_tokens = torch.stack([image_embedding, text_embedding, proprio_embedding], dim=1)
-        
+
         fused = self.fusion(fusion_tokens)
         pooled = fused.mean(dim=1)
-        return self.head(pooled)
+        return pooled
+
+    def get_value(
+        self,
+        rgb_static: torch.Tensor,
+        instruction: List[str],
+        proprio: torch.Tensor,
+        action_history: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Get state value prediction from critic.
+
+        Args:
+            rgb_static: Batch of RGB images ``(B, C, H, W)`` normalized to ``[0, 1]``.
+            instruction: Batch of natural-language strings.
+            proprio: Batch of proprioceptive vectors ``(B, 8)`` - 7 joints + 1 timestep.
+            action_history: Batch of past actions ``(B, history_length, action_dim)`` or None.
+
+        Returns:
+            State values of shape ``(B, 1)``.
+        """
+        pooled = self._get_fused_features(rgb_static, instruction, proprio, action_history)
+        return self.value_head(pooled)
+
+    def get_action_and_value(
+        self,
+        rgb_static: torch.Tensor,
+        instruction: List[str],
+        proprio: torch.Tensor,
+        action_history: torch.Tensor | None = None,
+        action_std: float = 0.1,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get action, log probability, and value for RL training.
+
+        Args:
+            rgb_static: Batch of RGB images ``(B, C, H, W)`` normalized to ``[0, 1]``.
+            instruction: Batch of natural-language strings.
+            proprio: Batch of proprioceptive vectors ``(B, 8)`` - 7 joints + 1 timestep.
+            action_history: Batch of past actions ``(B, history_length, action_dim)`` or None.
+            action_std: Standard deviation for action noise.
+
+        Returns:
+            Tuple of (action, log_prob, value) where:
+                - action: Sampled actions of shape ``(B, action_dim)``
+                - log_prob: Log probabilities of shape ``(B,)``
+                - value: State values of shape ``(B, 1)``
+        """
+        pooled = self._get_fused_features(rgb_static, instruction, proprio, action_history)
+        action_mean = self.head(pooled)
+        value = self.value_head(pooled)
+
+        # Sample action from Gaussian policy
+        dist = torch.distributions.Normal(action_mean, action_std)
+        action = dist.sample()
+        log_prob = dist.log_prob(action).sum(dim=-1)  # Sum over action dimensions
+
+        return action, log_prob, value
+
+    def evaluate_actions(
+        self,
+        rgb_static: torch.Tensor,
+        instruction: List[str],
+        proprio: torch.Tensor,
+        actions: torch.Tensor,
+        action_history: torch.Tensor | None = None,
+        action_std: float = 0.1,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Evaluate actions for PPO update.
+
+        Args:
+            rgb_static: Batch of RGB images ``(B, C, H, W)`` normalized to ``[0, 1]``.
+            instruction: Batch of natural-language strings.
+            proprio: Batch of proprioceptive vectors ``(B, 8)`` - 7 joints + 1 timestep.
+            actions: Actions to evaluate of shape ``(B, action_dim)``.
+            action_history: Batch of past actions ``(B, history_length, action_dim)`` or None.
+            action_std: Standard deviation for action noise.
+
+        Returns:
+            Tuple of (log_prob, value, entropy) where:
+                - log_prob: Log probabilities of shape ``(B,)``
+                - value: State values of shape ``(B, 1)``
+                - entropy: Policy entropy of shape ``(B,)``
+        """
+        pooled = self._get_fused_features(rgb_static, instruction, proprio, action_history)
+        action_mean = self.head(pooled)
+        value = self.value_head(pooled)
+
+        # Compute log prob and entropy under current policy
+        dist = torch.distributions.Normal(action_mean, action_std)
+        log_prob = dist.log_prob(actions).sum(dim=-1)  # Sum over action dimensions
+        entropy = dist.entropy().sum(dim=-1)  # Sum over action dimensions
+
+        return log_prob, value, entropy
 
     # ------------------------------------------------------------------
     # Encoding helpers
