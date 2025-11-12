@@ -78,7 +78,7 @@ def collect_rollout(
         device=device,
     )
 
-    obs = env.reset()
+    obs, info = env.reset()  # Environment returns (obs, info) tuple
     action_tracker.reset()
 
     episode_rewards = []
@@ -118,8 +118,12 @@ def collect_rollout(
             else:
                 action_denorm = action_np
 
-            # Step environment
-            next_obs, reward, done, info = env.step(action_denorm)
+            # Step environment (returns StepResult object, not tuple)
+            step_result = env.step(action_denorm)
+            next_obs = step_result.observation
+            reward = step_result.reward
+            done = step_result.terminated or step_result.truncated
+            info = step_result.info
 
             # Store in buffer (squeeze batch dimension)
             buffer.add(
@@ -148,10 +152,10 @@ def collect_rollout(
             if done:
                 episode_rewards.append(current_episode_reward)
                 episode_lengths.append(current_episode_length)
-                successes.append(info.get("is_success", False))
+                successes.append(info.get("success", False))  # Fixed: use "success" not "is_success"
 
                 # Reset environment and trackers
-                obs = env.reset()
+                obs, info = env.reset()  # Environment returns (obs, info) tuple
                 action_tracker.reset()
                 current_episode_reward = 0
                 current_episode_length = 0
@@ -229,44 +233,45 @@ def main() -> None:
     logger.info("Creating environment")
     env = FrankaPickPlaceEnv(
         asset_root=env_cfg.get("asset_root", "./env/mujoco_assets"),
-        max_steps=env_cfg.get("horizon", 1000),
-        reward_type=env_cfg.get("reward_type", "dense"),
-        render_mode="human" if args.render else None,
+        gui=args.render,  # Use gui parameter instead of render_mode
+        seed=policy_cfg.get("seed", 42),
     )
+    # Note: max_steps is hardcoded to 340 in the environment
+    # Note: reward_type is not configurable (always uses distance-based reward)
 
-    # Create optimizer
-    learning_rate = policy_cfg.get("learning_rate", 5e-6)
+    # Create optimizer (convert to float in case YAML parses scientific notation as string)
+    learning_rate = float(policy_cfg.get("learning_rate", 5e-6))
     optimizer = optim.Adam(policy.parameters(), lr=learning_rate)
 
     # Create PPO trainer
     ppo_trainer = PPOTrainer(
         policy=policy,
         optimizer=optimizer,
-        clip_range=policy_cfg.get("clip_range", 0.2),
-        value_coef=policy_cfg.get("value_coef", 0.5),
-        entropy_coef=policy_cfg.get("entropy_coef", 0.01),
-        max_grad_norm=policy_cfg.get("max_grad_norm", 0.5),
-        action_std=policy_cfg.get("action_std", 0.1),
-        target_kl=policy_cfg.get("target_kl", 0.01),
+        clip_range=float(policy_cfg.get("clip_range", 0.2)),
+        value_coef=float(policy_cfg.get("value_coef", 0.5)),
+        entropy_coef=float(policy_cfg.get("entropy_coef", 0.01)),
+        max_grad_norm=float(policy_cfg.get("max_grad_norm", 0.5)),
+        action_std=float(policy_cfg.get("action_std", 0.1)),
+        target_kl=float(policy_cfg.get("target_kl", 0.01)),
     )
 
     # Create rollout buffer
     rollout_buffer = RolloutBuffer(
-        buffer_size=policy_cfg.get("rollout_length", 2048),
+        buffer_size=int(policy_cfg.get("rollout_length", 2048)),
         action_dim=model_config.action_dim,
         history_length=model_config.history_length,
         device=device,
     )
 
-    # Training loop
-    num_epochs = policy_cfg.get("num_epochs", 10)
-    rollout_length = policy_cfg.get("rollout_length", 2048)
-    ppo_epochs = policy_cfg.get("ppo_epochs", 4)
-    batch_size = policy_cfg.get("batch_size", 64)
-    action_std = policy_cfg.get("action_std", 0.1)
-    gamma = policy_cfg.get("gamma", 0.99)
-    gae_lambda = policy_cfg.get("gae_lambda", 0.95)
-    checkpoint_interval = logging_cfg.get("checkpoint_interval", 5)
+    # Training loop (ensure all numeric types are correct)
+    num_epochs = int(policy_cfg.get("num_epochs", 10))
+    rollout_length = int(policy_cfg.get("rollout_length", 2048))
+    ppo_epochs = int(policy_cfg.get("ppo_epochs", 4))
+    batch_size = int(policy_cfg.get("batch_size", 64))
+    action_std = float(policy_cfg.get("action_std", 0.1))
+    gamma = float(policy_cfg.get("gamma", 0.99))
+    gae_lambda = float(policy_cfg.get("gae_lambda", 0.95))
+    checkpoint_interval = int(logging_cfg.get("checkpoint_interval", 5))
 
     logger.info("Starting PPO training")
     logger.info(f"Epochs: {num_epochs}, Rollout length: {rollout_length}")
