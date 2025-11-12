@@ -235,9 +235,10 @@ def main() -> None:
         asset_root=env_cfg.get("asset_root", "./env/mujoco_assets"),
         gui=args.render,  # Use gui parameter instead of render_mode
         seed=policy_cfg.get("seed", 42),
+        reward_type=env_cfg.get("reward_type", "dense"),  # Now configurable!
     )
+    logger.info(f"Using reward type: {env.reward_type}")
     # Note: max_steps is hardcoded to 340 in the environment
-    # Note: reward_type is not configurable (always uses distance-based reward)
 
     # Create optimizer (convert to float in case YAML parses scientific notation as string)
     learning_rate = float(policy_cfg.get("learning_rate", 5e-6))

@@ -53,6 +53,7 @@ class FrankaPickPlaceEnv:
         height: int = 224,
         seed: Optional[int] = 0,
         camera_name: str = "top",
+        reward_type: str = "dense",  # "dense", "sparse", or "shaped"
     ) -> None:
         if mujoco is None:  # pragma: no cover - handled at runtime
             raise ImportError(
@@ -67,6 +68,11 @@ class FrankaPickPlaceEnv:
         self.height = height
         self.camera_name = camera_name
         self.rng = np.random.default_rng(seed)
+        
+        # Reward configuration
+        if reward_type not in ["dense", "sparse", "shaped"]:
+            raise ValueError(f"reward_type must be 'dense', 'sparse', or 'shaped', got '{reward_type}'")
+        self.reward_type = reward_type
 
         xml_path = self.asset_root / DEFAULT_XML
         if not xml_path.exists():
@@ -81,7 +87,7 @@ class FrankaPickPlaceEnv:
 
         self.step_dt = 0.04
         self.control_rate_hz = 1.0 / self.step_dt
-        self.max_steps = 400  # Increased to allow full pick-and-place sequence
+        self.max_steps = 340  # Must match MAX_EPISODE_STEPS in dataset/evaluation for consistent timestep normalization
         self.success_height = 0.15  # Height threshold for considering object "placed"
         self.workspace_extent = np.array([0.25, 0.25])
         self.bin_position = np.array([0.55, 0.45, 0.08])  # Closer to robot for easier center placement
@@ -236,7 +242,29 @@ class FrankaPickPlaceEnv:
         return float(np.linalg.norm(gripper_pos - target_pos))
 
     def _compute_reward(self) -> float:
-        return -self._target_distance()
+        """Compute reward based on configured reward type.
+        
+        Reward types:
+        - "dense": Negative distance to target (dense feedback, easier to learn)
+        - "sparse": +1 for success, 0 otherwise (harder, but more realistic)
+        - "shaped": Dense distance reward + bonus for success (best of both worlds)
+        """
+        if self.reward_type == "sparse":
+            # Sparse reward: only reward success
+            return 1.0 if self._check_success() else 0.0
+        
+        elif self.reward_type == "dense":
+            # Dense reward: negative distance (original behavior)
+            return -self._target_distance()
+        
+        elif self.reward_type == "shaped":
+            # Shaped reward: dense feedback + success bonus
+            distance_reward = -self._target_distance()
+            success_bonus = 10.0 if self._check_success() else 0.0
+            return distance_reward + success_bonus
+        
+        else:
+            raise ValueError(f"Unknown reward_type: {self.reward_type}")
 
     def _check_success(self) -> bool:
         """Check if the target object is successfully placed in the bin.
