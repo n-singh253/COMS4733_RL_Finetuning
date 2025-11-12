@@ -110,8 +110,9 @@ class LeRobotDataset(Dataset):
             
             # ADD TIMESTEP as 8th dimension for temporal awareness
             # Normalize timestep to [0, 1] using FIXED max_steps to match evaluation
-            # CRITICAL: Must use same normalization as evaluate_bc_mujoco.py (max_steps=340)
-            MAX_EPISODE_STEPS = 340  # Fixed constant matching evaluation
+            # CRITICAL: Must use same normalization as evaluate_bc_mujoco.py
+            # Updated for dense demos: max episode length ~196, use 220 for safety
+            MAX_EPISODE_STEPS = 220  # Fixed constant matching evaluation
             timesteps = torch.arange(start_t, end_t, dtype=torch.float32) / MAX_EPISODE_STEPS
             timesteps = timesteps.unsqueeze(-1)  # Shape: (seq_len, 1)
             

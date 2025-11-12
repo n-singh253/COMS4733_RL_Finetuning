@@ -189,7 +189,7 @@ def run_rollouts(
         while not done:
             step += 1
             # Pass timestep for temporal awareness (helps model learn "close at ~step 120, open at ~step 320")
-            rgb_tensor, proprio_tensor = preprocess_observation(observation, image_processor, device, timestep=step, max_steps=340)
+            rgb_tensor, proprio_tensor = preprocess_observation(observation, image_processor, device, timestep=step, max_steps=220)
             with torch.no_grad():
                 instructions = [instruction_text] * rgb_tensor.size(0)
                 # Pass action history for closed-loop control
@@ -263,7 +263,7 @@ def run_rollouts(
     return results, success_rate
 
 
-def preprocess_observation(observation, image_processor, device: torch.device, timestep: int = 0, max_steps: int = 340) -> Tuple[torch.Tensor, torch.Tensor]:
+def preprocess_observation(observation, image_processor, device: torch.device, timestep: int = 0, max_steps: int = 220) -> Tuple[torch.Tensor, torch.Tensor]:
     """Preprocess observation for model input.
     
     Args:
@@ -271,7 +271,7 @@ def preprocess_observation(observation, image_processor, device: torch.device, t
         image_processor: HuggingFace image processor
         device: torch device
         timestep: Current timestep in episode (for temporal awareness)
-        max_steps: Maximum episode length for timestep normalization (must match training: 340)
+        max_steps: Maximum episode length for timestep normalization (must match training: 220 for dense demos)
     
     Returns:
         rgb_tensor: Preprocessed RGB image
