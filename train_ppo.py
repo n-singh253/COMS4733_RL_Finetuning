@@ -177,7 +177,22 @@ def main() -> None:
     parser.add_argument("--config", type=str, default="rl/ppo_config.yaml")
     parser.add_argument("--checkpoint", type=str, default=None, help="BC checkpoint to load")
     parser.add_argument("--render", action="store_true", help="Render environment during rollouts")
+    parser.add_argument("--quick-test", action="store_true", 
+                        help="Run quick test with reduced epochs/rollouts (uses ppo_config_quick_test.yaml)")
     args = parser.parse_args()
+    
+    # Use quick test config if flag is set
+    if args.quick_test:
+        args.config = "rl/ppo_config_quick_test.yaml"
+        print("=" * 60)
+        print("QUICK TEST MODE ENABLED")
+        print("=" * 60)
+        print("Running reduced training for quick validation:")
+        print("  - 3 epochs instead of 100")
+        print("  - 256 steps/rollout instead of 2048")
+        print("  - Expected runtime: ~5-10 minutes")
+        print("=" * 60)
+        print()
 
     # Load config
     config = load_config(args.config)

@@ -52,13 +52,14 @@ Total Loss = Policy Loss + Value Coefficient × Value Loss + Entropy Coefficient
 ```
 COMS4733_RL_Finetuning/
 ├── rl/
-│   ├── ppo_config.yaml           # PPO hyperparameters and training config
-│   └── ppo_trainer.py            # PPO algorithm implementation
+│   ├── ppo_config.yaml                # Full PPO training config (~10 hours)
+│   ├── ppo_config_quick_test.yaml     # Quick test config (~5-10 minutes)
+│   └── ppo_trainer.py                 # PPO algorithm implementation
 ├── models/
-│   └── vla_dinov2.py             # VLA model with actor-critic heads
-├── train_ppo.py                  # Main PPO training script
-├── evaluate_ppo.py               # Evaluation script for RL-trained models
-└── RL_TRAINING.md                # This document
+│   └── vla_dinov2.py                  # VLA model with actor-critic heads
+├── train_ppo.py                       # Main PPO training script
+├── evaluate_ppo.py                    # Evaluation script for RL-trained models
+└── RL_TRAINING.md                     # This document
 ```
 
 ## Usage
@@ -73,7 +74,30 @@ python train_bc.py --config configs/openvla_dinov2_bc.yaml --epochs 35
 
 This creates a checkpoint: `runs/dinov2_bc_best.pt`
 
-### 2. Fine-tune with PPO
+### 2. Quick Test (Recommended First!)
+
+Before running full training, do a quick test to verify everything works:
+
+```bash
+python train_ppo.py --checkpoint runs/dinov2_bc_best.pt --quick-test
+```
+
+This will:
+- Run for only 3 epochs with reduced rollouts
+- Take ~5-10 minutes on M4 Max
+- Verify the training pipeline works
+- Save checkpoints to `runs/ppo_test/`
+
+**Expected output:**
+```
+QUICK TEST MODE ENABLED
+Running reduced training for quick validation:
+  - 3 epochs instead of 100
+  - 256 steps/rollout instead of 2048
+  - Expected runtime: ~5-10 minutes
+```
+
+### 3. Full PPO Training
 
 Fine-tune the BC model using PPO:
 
@@ -132,6 +156,43 @@ policy:
   # Discount and GAE
   gamma: 0.99                  # Discount factor
   gae_lambda: 0.95             # GAE lambda
+
+environment:
+  reward_type: shaped          # Reward shaping strategy
+```
+
+### Reward Types
+
+The environment supports three reward types (configured in `ppo_config.yaml`):
+
+**1. `dense` (Default - Easiest)**
+```python
+reward = -distance_to_target  # Range: ~[-0.8, 0.0]
+```
+- Continuous feedback at every step
+- Easy to learn from, but may not prioritize task completion
+- Good for initial exploration
+
+**2. `sparse` (Most Realistic)**
+```python
+reward = 1.0 if success else 0.0  # Range: {0.0, 1.0}
+```
+- Only rewards successful task completion
+- Harder to learn, requires good initialization (use BC warmup!)
+- Most realistic for real-world deployment
+
+**3. `shaped` (Recommended)**
+```python
+reward = -distance_to_target + 10.0 * success  # Range: ~[-0.8, 10.0]
+```
+- Dense guidance + strong success bonus
+- Best balance for RL fine-tuning
+- Encourages both approaching and completing the task
+
+**To change reward type**, edit `rl/ppo_config.yaml`:
+```yaml
+environment:
+  reward_type: shaped  # Change to: dense, sparse, or shaped
 ```
 
 ### Tuning Tips
@@ -140,6 +201,7 @@ policy:
 - Increase `rollout_length` to collect more data
 - Decrease `learning_rate` to make updates more conservative
 - Increase `entropy_coef` to encourage more exploration
+- Try different `reward_type` (shaped is usually best)
 
 **If training is unstable:**
 - Decrease `learning_rate`
