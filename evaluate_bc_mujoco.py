@@ -78,7 +78,9 @@ def main() -> None:
 
     model_config = VLADinoV2Config(**model_cfg)
     policy = VLADinoV2Policy(model_config)
-    policy.load_state_dict(checkpoint["model_state"])
+    # Use strict=False to handle BC checkpoints that don't have value_head (RL critic)
+    policy.load_state_dict(checkpoint["model_state"], strict=False)
+    logger.info("Loaded BC checkpoint (value_head not present, only actor/policy head)")
     policy.eval()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

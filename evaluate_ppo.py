@@ -75,7 +75,7 @@ def evaluate_policy(
 
     with torch.no_grad():
         for episode in range(num_episodes):
-            obs = env.reset()
+            obs, info = env.reset()  # Environment returns (obs, info) tuple
             action_tracker.reset()
 
             episode_reward = 0
@@ -122,8 +122,12 @@ def evaluate_policy(
                 else:
                     action_denorm = action_np
 
-                # Step environment
-                obs, reward, done, info = env.step(action_denorm)
+                # Step environment (returns StepResult object, not tuple)
+                step_result = env.step(action_denorm)
+                obs = step_result.observation
+                reward = step_result.reward
+                done = step_result.terminated or step_result.truncated
+                info = step_result.info
 
                 # Update action history
                 action_tracker.update(action.squeeze(0))
@@ -141,7 +145,7 @@ def evaluate_policy(
 
             episode_rewards.append(episode_reward)
             episode_lengths.append(episode_length)
-            successes.append(info.get("is_success", False))
+            successes.append(info.get("success", False))  # Fixed: use "success" not "is_success"
 
             print(f"Episode {episode + 1}/{num_episodes}: "
                   f"Reward={episode_reward:.2f}, "
@@ -203,9 +207,9 @@ def main() -> None:
     logger.info("Creating environment")
     env = FrankaPickPlaceEnv(
         asset_root="./env/mujoco_assets",
-        max_steps=400,
-        reward_type="dense",
-        render_mode="human" if args.render else None,
+        gui=args.render,  # Use gui parameter
+        seed=42,
+        reward_type="dense",  # Can be made configurable via args if needed
     )
 
     # Evaluate policy
