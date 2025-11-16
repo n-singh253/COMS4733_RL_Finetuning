@@ -236,13 +236,35 @@ def train_one_epoch(
         with autocast(enabled=use_amp):
             pred = model(rgb_static=rgb, proprio=proprio, instruction=instructions, action_history=action_history)
             
-            # Compute weighted loss with ADAPTIVE gripper weighting
-            # With normalized gripper (same scale as joints), lower weight is sufficient
+            # Compute weighted loss with HIGHER gripper weighting
+            # Need strong emphasis on gripper to learn open/close behavior
             epoch_progress = epoch / total_epochs
-            gripper_weight = 3.0 * (1.0 - 0.5 * epoch_progress)  # 3x → 1.5x over training
+            gripper_weight = 10.0  # Fixed high weight (was adaptive 3x → 1.5x, too low)
             
             joint_loss = criterion(pred[:, :7], target[:, :7])
             gripper_loss = criterion(pred[:, 7:8], target[:, 7:8])
+            
+            # Multi-task learning: Add object detection auxiliary loss
+            # This forces the model to learn explicit visual grounding before action prediction
+            object_detection_loss = torch.tensor(0.0, device=device)
+            if hasattr(model, 'object_detection_head') and model.object_detection_head is not None:
+                object_pos_gt = batch.get("object_position")
+                if object_pos_gt is not None:
+                    object_pos_gt = object_pos_gt.to(device)
+                    object_pos_pred = model.predict_object_position(
+                        rgb_static=rgb, 
+                        proprio=proprio, 
+                        instruction=instructions, 
+                        action_history=action_history
+                    )
+                    # MSE loss for 2D position regression
+                    object_detection_loss = criterion(object_pos_pred, object_pos_gt)
+                    # Weight from config (default: 10.0)
+                    object_detection_weight = model.config.object_detection_weight
+                else:
+                    object_detection_weight = 0.0
+            else:
+                object_detection_weight = 0.0
             
             # DISABLED: Smoothness loss can cause training instability
             # Will re-enable after confirming base training works
@@ -251,12 +273,13 @@ def train_one_epoch(
             #     action_diffs = pred[1:, :7] - pred[:-1, :7]
             #     smoothness_loss = (action_diffs ** 2).mean()
             
-            loss = joint_loss + gripper_weight * gripper_loss  # Removed smoothness term
+            # Combined loss: action prediction + object detection
+            loss = joint_loss + gripper_weight * gripper_loss + object_detection_weight * object_detection_loss
         
         # Safety: Skip batch if loss is non-finite (NaN or Inf)
         if not torch.isfinite(loss):
             get_logger("train_bc").warning(f"Skipping batch with non-finite loss at epoch {epoch}, step {step}")
-            get_logger("train_bc").warning(f"  joint_loss={joint_loss.item():.4f}, gripper_loss={gripper_loss.item():.4f}")
+            get_logger("train_bc").warning(f"  joint_loss={joint_loss.item():.4f}, gripper_loss={gripper_loss.item():.4f}, obj_det_loss={object_detection_loss.item():.4f}")
             continue
         
         # Backward pass with gradient scaling
@@ -305,15 +328,33 @@ def evaluate(
 
             pred = model(rgb_static=rgb, proprio=proprio, instruction=instructions, action_history=action_history)
             
-            # Use same adaptive weighted loss as training
-            epoch_progress = epoch / total_epochs
-            gripper_weight = 3.0 * (1.0 - 0.5 * epoch_progress)
+            # Use same high gripper weight as training
+            gripper_weight = 10.0  # Fixed high weight (same as training)
             
             joint_loss = criterion(pred[:, :7], target[:, :7])
             gripper_loss = criterion(pred[:, 7:8], target[:, 7:8])
             
+            # Multi-task learning: Add object detection auxiliary loss (same as training)
+            object_detection_loss = torch.tensor(0.0, device=device)
+            if hasattr(model, 'object_detection_head') and model.object_detection_head is not None:
+                object_pos_gt = batch.get("object_position")
+                if object_pos_gt is not None:
+                    object_pos_gt = object_pos_gt.to(device)
+                    object_pos_pred = model.predict_object_position(
+                        rgb_static=rgb, 
+                        proprio=proprio, 
+                        instruction=instructions, 
+                        action_history=action_history
+                    )
+                    object_detection_loss = criterion(object_pos_pred, object_pos_gt)
+                    object_detection_weight = model.config.object_detection_weight
+                else:
+                    object_detection_weight = 0.0
+            else:
+                object_detection_weight = 0.0
+            
             # Smoothness disabled (same as training)
-            loss = joint_loss + gripper_weight * gripper_loss
+            loss = joint_loss + gripper_weight * gripper_loss + object_detection_weight * object_detection_loss
             
             tracker.update(loss.item(), rgb.size(0))
     return tracker.average

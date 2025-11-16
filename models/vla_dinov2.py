@@ -23,6 +23,8 @@ class VLADinoV2Config:
     freeze_language: bool = False
     dropout: float = 0.1
     history_length: int = 5  # Number of past actions to condition on
+    use_object_detection: bool = True  # Multi-task learning with object detection
+    object_detection_weight: float = 10.0  # Weight for object detection loss
 
 
 class VLADinoV2Policy(nn.Module):
@@ -48,7 +50,7 @@ class VLADinoV2Policy(nn.Module):
             nn.Linear(language_dim, config.fusion_hidden_dim),
         )
         self.proprio_projection = nn.Sequential(
-            nn.Linear(8, config.fusion_hidden_dim),  # 7 joints + 1 timestep
+            nn.Linear(7, config.fusion_hidden_dim),  # 7 joints ONLY (no timestep)
             nn.ReLU(),
             nn.Linear(config.fusion_hidden_dim, config.fusion_hidden_dim),
         )
@@ -83,6 +85,20 @@ class VLADinoV2Policy(nn.Module):
             nn.Linear(config.fusion_hidden_dim, 1),
         )
 
+        # Object detection head for multi-task learning
+        # Predicts 2D object position in image space (normalized [0,1])
+        if config.use_object_detection:
+            self.object_detection_head = nn.Sequential(
+                nn.LayerNorm(config.fusion_hidden_dim),
+                nn.Linear(config.fusion_hidden_dim, 256),
+                nn.ReLU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(256, 2),  # (x, y) in normalized image coordinates
+                nn.Sigmoid(),  # Ensure output in [0, 1]
+            )
+        else:
+            self.object_detection_head = None
+
         if config.freeze_vision:
             for param in self.vision_encoder.parameters():
                 param.requires_grad = False
@@ -105,7 +121,7 @@ class VLADinoV2Policy(nn.Module):
         Args:
             rgb_static: Batch of RGB images ``(B, C, H, W)`` normalized to ``[0, 1]``.
             instruction: Batch of natural-language strings.
-            proprio: Batch of proprioceptive vectors ``(B, 8)`` - 7 joints + 1 timestep.
+            proprio: Batch of proprioceptive vectors ``(B, 7)`` - 7 joints only (no timestep).
             action_history: Batch of past actions ``(B, history_length, action_dim)`` or None.
         """
         pooled = self._get_fused_features(rgb_static, instruction, proprio, action_history)
@@ -158,7 +174,7 @@ class VLADinoV2Policy(nn.Module):
         Args:
             rgb_static: Batch of RGB images ``(B, C, H, W)`` normalized to ``[0, 1]``.
             instruction: Batch of natural-language strings.
-            proprio: Batch of proprioceptive vectors ``(B, 8)`` - 7 joints + 1 timestep.
+            proprio: Batch of proprioceptive vectors ``(B, 7)`` - 7 joints only (no timestep).
             action_history: Batch of past actions ``(B, history_length, action_dim)`` or None.
 
         Returns:
@@ -166,6 +182,29 @@ class VLADinoV2Policy(nn.Module):
         """
         pooled = self._get_fused_features(rgb_static, instruction, proprio, action_history)
         return self.value_head(pooled)
+
+    def predict_object_position(
+        self,
+        rgb_static: torch.Tensor,
+        instruction: List[str],
+        proprio: torch.Tensor,
+        action_history: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Predict 2D object position from visual observations.
+
+        Args:
+            rgb_static: Batch of RGB images ``(B, C, H, W)`` normalized to ``[0, 1]``.
+            instruction: Batch of natural-language strings.
+            proprio: Batch of proprioceptive vectors ``(B, 7)`` - 7 joints only (no timestep).
+            action_history: Batch of past actions ``(B, history_length, action_dim)`` or None.
+
+        Returns:
+            Object positions: (B, 2) - (x, y) in normalized [0, 1] image coordinates
+        """
+        if self.object_detection_head is None:
+            raise RuntimeError("Object detection head not initialized. Set use_object_detection=True in config.")
+        pooled = self._get_fused_features(rgb_static, instruction, proprio, action_history)
+        return self.object_detection_head(pooled)
 
     def get_action_and_value(
         self,
@@ -180,7 +219,7 @@ class VLADinoV2Policy(nn.Module):
         Args:
             rgb_static: Batch of RGB images ``(B, C, H, W)`` normalized to ``[0, 1]``.
             instruction: Batch of natural-language strings.
-            proprio: Batch of proprioceptive vectors ``(B, 8)`` - 7 joints + 1 timestep.
+            proprio: Batch of proprioceptive vectors ``(B, 7)`` - 7 joints only (no timestep).
             action_history: Batch of past actions ``(B, history_length, action_dim)`` or None.
             action_std: Standard deviation for action noise.
 
@@ -215,7 +254,7 @@ class VLADinoV2Policy(nn.Module):
         Args:
             rgb_static: Batch of RGB images ``(B, C, H, W)`` normalized to ``[0, 1]``.
             instruction: Batch of natural-language strings.
-            proprio: Batch of proprioceptive vectors ``(B, 8)`` - 7 joints + 1 timestep.
+            proprio: Batch of proprioceptive vectors ``(B, 7)`` - 7 joints only (no timestep).
             actions: Actions to evaluate of shape ``(B, action_dim)``.
             action_history: Batch of past actions ``(B, history_length, action_dim)`` or None.
             action_std: Standard deviation for action noise.

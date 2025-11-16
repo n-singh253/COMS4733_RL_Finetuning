@@ -11,6 +11,11 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 
+# Import object detection utility
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from utils.object_detection import detect_object_position_from_rgb
+
 
 @dataclass
 class EpisodeIndex:
@@ -98,6 +103,29 @@ class LeRobotDataset(Dataset):
                 sample["rgb_static"] = frames[0]
             else:
                 sample["rgb_static"] = torch.stack(frames, dim=0)
+            
+            # Extract ground truth object position from RGB image (for multi-task learning)
+            # Use color-based detection on the first frame
+            if self.sequence_length == 1:
+                rgb_for_detection = frames[0]
+            else:
+                rgb_for_detection = frames[0]  # Use first frame
+            
+            # Convert from (C, H, W) to (H, W, C) for detection
+            rgb_np = rgb_for_detection.permute(1, 2, 0).numpy()
+            # Extract target color from instruction (e.g. "Pick up the red sphere...")
+            instruction = episode.instruction.lower()
+            if "red" in instruction:
+                target_color = "red"
+            elif "green" in instruction:
+                target_color = "green"
+            elif "blue" in instruction:
+                target_color = "blue"
+            else:
+                target_color = "red"  # default
+            
+            obj_x, obj_y = detect_object_position_from_rgb(rgb_np, target_color=target_color)
+            sample["object_position"] = torch.tensor([obj_x, obj_y], dtype=torch.float32)
 
         if "proprio" in self.modalities:
             proprio = torch.from_numpy(data["proprio"][start_t:end_t]).float()
@@ -108,16 +136,9 @@ class LeRobotDataset(Dataset):
                 joint_max = 2.8973
                 proprio = 2.0 * (proprio - joint_min) / (joint_max - joint_min) - 1.0
             
-            # ADD TIMESTEP as 8th dimension for temporal awareness
-            # Normalize timestep to [0, 1] using FIXED max_steps to match evaluation
-            # CRITICAL: Must use same normalization as evaluate_bc_mujoco.py
-            # Updated for dense demos: max episode length ~196, use 220 for safety
-            MAX_EPISODE_STEPS = 220  # Fixed constant matching evaluation
-            timesteps = torch.arange(start_t, end_t, dtype=torch.float32) / MAX_EPISODE_STEPS
-            timesteps = timesteps.unsqueeze(-1)  # Shape: (seq_len, 1)
-            
-            # Concatenate: (seq_len, 7) + (seq_len, 1) → (seq_len, 8)
-            proprio = torch.cat([proprio, timesteps], dim=-1)
+            # REMOVED TIMESTEP: Testing hypothesis that timestep enables harmful open-loop behavior
+            # The model should rely on visual feedback and action history, not timestep
+            # proprio is now pure joint positions (7 dims) without temporal cue
             
             sample["proprio"] = proprio if self.sequence_length > 1 else proprio.squeeze(0)
 
@@ -209,6 +230,8 @@ class LeRobotDataset(Dataset):
                 batch_tensors.setdefault("action", []).append(item["action"])  # type: ignore[arg-type]
             if "action_history" in item:
                 batch_tensors.setdefault("action_history", []).append(item["action_history"])  # type: ignore[arg-type]
+            if "object_position" in item:
+                batch_tensors.setdefault("object_position", []).append(item["object_position"])  # type: ignore[arg-type]
             if "instruction" in item:
                 instructions.append(item["instruction"])  # type: ignore[arg-type]
 

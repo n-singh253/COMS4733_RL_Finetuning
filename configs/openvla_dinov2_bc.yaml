@@ -5,24 +5,26 @@ dataset:
   batch_size: 16
   num_workers: 8
   sequence_length: 1
-  normalize_proprio: true  # Normalizes 7 joint positions + adds normalized timestep (8th dim)
+  normalize_proprio: true  # Normalizes 7 joint positions (NO timestep - removed for testing)
   cache_dataset: false
 
 model:
   vision_encoder: facebook/dinov2-base
   language_encoder: bert-base-uncased
-  fusion_hidden_dim: 768  # Increased from 512 for better spatial reasoning
-  fusion_layers: 4  # Increased from 2 for stronger vision-action coupling
-  action_dim: 8  # 7 joint positions + 1 gripper position
+  fusion_hidden_dim: 384  # Increased from 512 for better spatial reasoning
+  fusion_layers: 2  # Increased from 2 for stronger vision-action coupling
+  action_dim: 8  # 7 joint positions + 1 gripper position (actions still 8-dim, proprio now 7-dim)
   max_instruction_tokens: 64
-  freeze_vision: false  # CRITICAL: Allow vision encoder to learn task-specific features
-  freeze_language: false
-  dropout: 0.05  # Reduced from 0.1 to retain more learned features
-  history_length: 10  # Number of past actions for closed-loop control
+  freeze_vision: true  # CRITICAL: Allow vision encoder to learn task-specific features
+  freeze_language: true  # Freeze BERT to reduce overfitting (simple instructions, pretrained is enough)
+  dropout: 0.2  # Reduced from 0.1 to retain more learned features
+  history_length: 5  # Number of past actions for closed-loop control (sweet spot: not too short, not too long)
+  use_object_detection: false  # DISABLED: Timestep removal test first, then re-enable if needed
+  object_detection_weight: 10.0  # Weight for object detection auxiliary loss (helps vision learning)
 
 training:
-  epochs: 35  # More epochs needed when fine-tuning vision encoder
-  lr: 0.0001  # Increased from 0.00003 for better convergence with 350 episodes
+  epochs: 20  # Extended training for better closed-loop control learning
+  lr: 0.0001 # Slightly lower than 0.0001 for more stable convergence
   weight_decay: 0.01
   grad_clip: 5.0  # Increased to prevent gradient spikes during early training
   device: cuda
@@ -39,3 +41,4 @@ evaluation:
   episodes_hindered: 50
   asset_root: ./env/mujoco_assets
   render: false  # Set to true for GUI visualization (slower)
+

@@ -10,16 +10,18 @@ dataset:
 model:
   vision_encoder: facebook/dinov2-base
   language_encoder: bert-base-uncased
-  fusion_hidden_dim: 768
-  fusion_layers: 4
+  fusion_hidden_dim: 384
+  fusion_layers: 2
   action_dim: 8
   max_instruction_tokens: 64
-  freeze_vision: false
-  freeze_language: false
-  dropout: 0.05
-  history_length: 10
+  freeze_vision: true
+  freeze_language: true
+  dropout: 0.2
+  history_length: 5
+  use_object_detection: false
+  object_detection_weight: 10.0
 training:
-  epochs: 35
+  epochs: 20
   lr: 0.0001
   weight_decay: 0.01
   grad_clip: 5.0

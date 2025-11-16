@@ -191,7 +191,7 @@ def run_rollouts(
         while not done:
             step += 1
             # Pass timestep for temporal awareness (helps model learn "close at ~step 120, open at ~step 320")
-            rgb_tensor, proprio_tensor = preprocess_observation(observation, image_processor, device, timestep=step, max_steps=220)
+            rgb_tensor, proprio_tensor = preprocess_observation(observation, image_processor, device, timestep=step, max_steps=200)
             with torch.no_grad():
                 instructions = [instruction_text] * rgb_tensor.size(0)
                 # Pass action history for closed-loop control
@@ -265,19 +265,19 @@ def run_rollouts(
     return results, success_rate
 
 
-def preprocess_observation(observation, image_processor, device: torch.device, timestep: int = 0, max_steps: int = 220) -> Tuple[torch.Tensor, torch.Tensor]:
+def preprocess_observation(observation, image_processor, device: torch.device, timestep: int = 0, max_steps: int = 200) -> Tuple[torch.Tensor, torch.Tensor]:
     """Preprocess observation for model input.
     
     Args:
         observation: Dict with 'rgb_static' and 'proprio' keys
         image_processor: HuggingFace image processor
         device: torch device
-        timestep: Current timestep in episode (for temporal awareness)
-        max_steps: Maximum episode length for timestep normalization (must match training: 220 for dense demos)
+        timestep: Current timestep in episode (DEPRECATED - no longer used)
+        max_steps: Maximum episode length (DEPRECATED - no longer used)
     
     Returns:
         rgb_tensor: Preprocessed RGB image
-        proprio_tensor: Proprio + timestep concatenated (8-dim)
+        proprio_tensor: Normalized joint positions (7-dim, NO timestep)
     """
     if isinstance(observation, dict):
         # Use explicit key checking to avoid numpy array ambiguity with 'or' operator
@@ -308,7 +308,7 @@ def preprocess_observation(observation, image_processor, device: torch.device, t
     rgb_tensor = inputs["pixel_values"].to(device)
 
     if proprio is None:
-        proprio_tensor = torch.zeros(1, 8, device=device)  # 7 joints + 1 timestep
+        proprio_tensor = torch.zeros(1, 7, device=device)  # 7 joints only (NO timestep)
     else:
         if isinstance(proprio, torch.Tensor):
             proprio_tensor = proprio.float().to(device).unsqueeze(0)
@@ -324,13 +324,9 @@ def preprocess_observation(observation, image_processor, device: torch.device, t
         joint_max = 2.8973
         proprio_tensor = 2.0 * (proprio_tensor - joint_min) / (joint_max - joint_min) - 1.0
     
-    # Add normalized timestep as 8th dimension (for temporal awareness)
-    timestep_normalized = timestep / max(max_steps, 1)  # Normalize to [0, 1]
-    timestep_tensor = torch.tensor([[timestep_normalized]], dtype=torch.float32, device=device)
+    # REMOVED TIMESTEP: Testing hypothesis that timestep enables harmful open-loop behavior
+    # Model now receives only joint positions (7 dims), forcing it to rely on vision + action history
     
-    # Concatenate: (1, 7) + (1, 1) → (1, 8)
-    proprio_tensor = torch.cat([proprio_tensor, timestep_tensor], dim=-1)
-
     return rgb_tensor, proprio_tensor
 
 

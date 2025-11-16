@@ -5,20 +5,20 @@ policy:
   # Checkpoint from BC pre-training (warmup phase)
   checkpoint: ./runs/dinov2_bc_best.pt
 
-  # PPO hyperparameters
-  learning_rate: 3e-6  # Lower LR for fine-tuning pre-trained model
-  clip_range: 0.2  # Standard PPO clip range
+  # PPO hyperparameters (MODERATE - BC can grasp, just wrong transport direction)
+  learning_rate: 1e-6  # Low but reasonable (BC is partially working!)
+  clip_range: 0.05  # Moderate clipping
   value_coef: 0.5  # Coefficient for value loss
-  entropy_coef: 0.01  # Entropy bonus for exploration
-  max_grad_norm: 0.5  # Gradient clipping
-  action_std: 0.1  # Standard deviation for Gaussian policy
-  target_kl: 0.01  # Target KL for early stopping
+  entropy_coef: 0.0  # No entropy bonus
+  max_grad_norm: 0.3  # Allow larger gradients
+  action_std: 0.02  # Some exploration to find correct direction
+  target_kl: 0.02  # Standard tolerance
 
-  # Training schedule
-  num_epochs: 100  # Total number of rollout epochs
-  rollout_length: 2048  # Steps to collect per epoch
-  ppo_epochs: 4  # Number of PPO update epochs per rollout
-  batch_size: 64  # Minibatch size for PPO updates
+  # Training schedule (constrained by user: max 35 epochs, 1024 rollout)
+  num_epochs: 35  # Total number of rollout epochs
+  rollout_length: 512  # Steps to collect per epoch (~5 complete episodes at 200 steps each)
+  ppo_epochs: 2  # Two gradient steps (BC is good starting point)
+  batch_size: 64  # Moderate batch size
 
   # Discount and GAE
   gamma: 0.99  # Discount factor
@@ -35,5 +35,4 @@ environment:
 
 logging:
   output_dir: ./runs/ppo
-  checkpoint_interval: 5  # Save checkpoint every N epochs
-  eval_interval: 10  # Evaluate every N epochs
+  # Checkpoints: Only saves best (by success rate) and last epoch automatically

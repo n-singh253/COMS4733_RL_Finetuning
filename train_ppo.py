@@ -93,9 +93,9 @@ def collect_rollout(
             rgb = torch.from_numpy(obs["rgb_static"]).to(device).float().permute(2, 0, 1).unsqueeze(0)
             proprio = torch.from_numpy(obs["proprio"]).to(device).float()
 
-            # Add timestep to proprio
-            timestep = torch.tensor([step / env.max_steps], device=device, dtype=torch.float32)
-            proprio = torch.cat([proprio, timestep], dim=-1).unsqueeze(0)
+            # REMOVED TIMESTEP: Testing hypothesis that timestep enables harmful open-loop behavior
+            # Model now receives only joint positions (7 dims), forcing it to rely on vision + action history
+            proprio = proprio.unsqueeze(0)  # Add batch dimension: (7,) -> (1, 7)
 
             # Get action history
             action_history = action_tracker.get().unsqueeze(0)
@@ -287,12 +287,13 @@ def main() -> None:
     action_std = float(policy_cfg.get("action_std", 0.1))
     gamma = float(policy_cfg.get("gamma", 0.99))
     gae_lambda = float(policy_cfg.get("gae_lambda", 0.95))
-    checkpoint_interval = int(logging_cfg.get("checkpoint_interval", 5))
 
     logger.info("Starting PPO training")
     logger.info(f"Epochs: {num_epochs}, Rollout length: {rollout_length}")
 
     global_step = 0
+    best_success_rate = -1.0  # Track best success rate
+    best_checkpoint_path = output_dir / "ppo_best.pt"
 
     for epoch in range(num_epochs):
         logger.info(f"\n{'='*50}")
@@ -359,20 +360,22 @@ def main() -> None:
             writer.add_scalar(key, value, global_step)
             logger.info(f"  {key}: {value:.4f}")
 
-        # Save checkpoint
-        if (epoch + 1) % checkpoint_interval == 0:
-            checkpoint_path = output_dir / f"ppo_epoch_{epoch + 1}.pt"
+        # Save best checkpoint based on success rate
+        current_success_rate = rollout_metrics.get("rollout/success_rate", 0.0)
+        if current_success_rate > best_success_rate:
+            best_success_rate = current_success_rate
             torch.save({
                 "epoch": epoch + 1,
                 "model_state": policy.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "config": model_config.__dict__,
                 "global_step": global_step,
-            }, checkpoint_path)
-            logger.info(f"Saved checkpoint to {checkpoint_path}")
+                "success_rate": best_success_rate,
+            }, best_checkpoint_path)
+            logger.info(f"✓ New best success rate: {best_success_rate:.2%} - Saved to {best_checkpoint_path}")
 
-    # Save final checkpoint
-    final_checkpoint_path = output_dir / "ppo_final.pt"
+    # Save final checkpoint (last epoch)
+    final_checkpoint_path = output_dir / "ppo_last.pt"
     torch.save({
         "epoch": num_epochs,
         "model_state": policy.state_dict(),
@@ -381,6 +384,7 @@ def main() -> None:
         "global_step": global_step,
     }, final_checkpoint_path)
     logger.info(f"Saved final checkpoint to {final_checkpoint_path}")
+    logger.info(f"Best success rate achieved: {best_success_rate:.2%} (saved at {best_checkpoint_path})")
 
     writer.close()
     env.close()
