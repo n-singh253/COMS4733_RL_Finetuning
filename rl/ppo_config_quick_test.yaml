@@ -6,18 +6,18 @@ policy:
   checkpoint: ./runs/dinov2_bc_best.pt
 
   # PPO hyperparameters (tuned for BC warmstart with dense demos)
-  learning_rate: 1e-6  # Very low LR to prevent policy collapse (was 3e-6, caused KL=5.9)
-  clip_range: 0.1  # Tighter clipping to stay close to BC initialization (was 0.2)
-  value_coef: 0.5  # Coefficient for value loss
-  entropy_coef: 0.0  # No entropy bonus - BC policy already has good exploration (was 0.01)
+  learning_rate: 1e-7  # Ultra-low LR during value head warmup phase
+  clip_range: 0.05  # Very tight clipping during warmup (will increase later)
+  value_coef: 1.0  # Higher weight on value learning to fix random initialization
+  entropy_coef: 0.01  # Moderate entropy to maintain exploration
   max_grad_norm: 0.5  # Gradient clipping
-  action_std: 0.05  # Smaller noise for fine-tuning (was 0.1)
-  target_kl: 0.02  # Slightly higher tolerance (was 0.01, too strict for warmstart)
+  action_std: 0.15  # Higher exploration noise to smooth out KL
+  target_kl: 0.1  # More lenient during warmup phase
 
   # Training schedule - REDUCED FOR QUICK TEST
   num_epochs: 3  # Only 3 epochs for quick test
   rollout_length: 256  # Shorter rollouts (8x faster)
-  ppo_epochs: 2  # Fewer update epochs
+  ppo_epochs: 4  # More epochs to let value head learn (was 2)
   batch_size: 64  # Minibatch size for PPO updates
 
   # Discount and GAE

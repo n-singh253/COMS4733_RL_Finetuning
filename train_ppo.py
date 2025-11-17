@@ -247,8 +247,14 @@ def main() -> None:
     policy = VLADinoV2Policy(model_config)
 
     # Load BC weights (actor head)
-    policy.load_state_dict(checkpoint["model_state"], strict=False)
-    logger.info("Loaded BC weights (value head initialized randomly)")
+    state_dict = checkpoint["model_state"]
+    if "proprio_projection.0.weight" in state_dict:
+        # Slice to keep only first 7 dimensions (remove timestep)
+        state_dict["proprio_projection.0.weight"] = state_dict["proprio_projection.0.weight"][:, :7]
+
+    # Load BC weights (actor head)
+    policy.load_state_dict(state_dict, strict=False)
+    logger.info("Loaded BC weights (sliced proprio_projection to 7D, value_head initialized randomly)")
 
     policy.to(device)
     policy.train()

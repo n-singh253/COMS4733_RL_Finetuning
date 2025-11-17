@@ -319,13 +319,13 @@ class PPOTrainer:
 
                 all_metrics.append(info)
 
-                # Early stopping if KL divergence is too high
-                if approx_kl > 1.5 * self.target_kl:
+                # Early stopping if KL divergence is too high (use 3x multiplier for warmstart with random value head)
+                if approx_kl > 3.0 * self.target_kl:
                     print(f"Early stopping at epoch {epoch} due to high KL divergence: {approx_kl:.4f}")
                     break
 
             # Check for early stopping after each epoch
-            if approx_kl > 1.5 * self.target_kl:
+            if approx_kl > 3.0 * self.target_kl:
                 break
 
         # Average metrics across all minibatches
