@@ -211,20 +211,23 @@ class PPOTrainer:
         advantages = batch.advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+        # Normalize returns for value loss stability (CRITICAL for preventing divergence)
+        returns_normalized = (batch.returns - batch.returns.mean()) / (batch.returns.std() + 1e-8)
+
         # PPO clipped objective
         surr1 = ratio * advantages
         surr2 = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range) * advantages
         policy_loss = -torch.min(surr1, surr2).mean()
 
-        # Value loss (clipped)
+        # Value loss (clipped) - using normalized returns
         new_values = new_values.squeeze(-1)
         value_pred_clipped = batch.values.squeeze(-1) + torch.clamp(
             new_values - batch.values.squeeze(-1),
             -self.clip_range,
             self.clip_range,
         )
-        value_loss_unclipped = (new_values - batch.returns) ** 2
-        value_loss_clipped = (value_pred_clipped - batch.returns) ** 2
+        value_loss_unclipped = (new_values - returns_normalized) ** 2
+        value_loss_clipped = (value_pred_clipped - returns_normalized) ** 2
         value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
 
         # Entropy loss (for exploration)
@@ -250,6 +253,13 @@ class PPOTrainer:
             "policy/approx_kl": approx_kl.item(),
             "policy/clip_fraction": clip_fraction.item(),
             "policy/entropy": -entropy_loss.item(),
+            "debug/value_mean": new_values.mean().item(),
+            "debug/value_std": new_values.std().item(),
+            "debug/return_mean": batch.returns.mean().item(),
+            "debug/return_std": batch.returns.std().item(),
+            "debug/advantage_mean": advantages.mean().item(),
+            "debug/advantage_std": advantages.std().item(),
+            "debug/ratio_mean": ratio.mean().item(),
         }
 
         return total_loss, info, approx_kl
@@ -309,13 +319,13 @@ class PPOTrainer:
 
                 all_metrics.append(info)
 
-                # Early stopping if KL divergence is too high
-                if approx_kl > 1.5 * self.target_kl:
+                # Early stopping if KL divergence is too high (use 3x multiplier for warmstart with random value head)
+                if approx_kl > 3.0 * self.target_kl:
                     print(f"Early stopping at epoch {epoch} due to high KL divergence: {approx_kl:.4f}")
                     break
 
             # Check for early stopping after each epoch
-            if approx_kl > 1.5 * self.target_kl:
+            if approx_kl > 3.0 * self.target_kl:
                 break
 
         # Average metrics across all minibatches

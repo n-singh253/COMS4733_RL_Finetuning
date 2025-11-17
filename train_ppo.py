@@ -207,8 +207,17 @@ def main() -> None:
     seed = policy_cfg.get("seed", 0)
     seed_everything(seed)
 
-    # Device setup
-    device = torch.device(policy_cfg.get("device", "cuda") if torch.cuda.is_available() else "cpu")
+    # Device setup - support M1/M2/M3 Mac GPU
+    device_name = policy_cfg.get("device", "auto")
+    if device_name == "auto":
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+    else:
+        device = torch.device(device_name)
     logger.info(f"Using device: {device}")
 
     # Create output directory
@@ -238,8 +247,14 @@ def main() -> None:
     policy = VLADinoV2Policy(model_config)
 
     # Load BC weights (actor head)
-    policy.load_state_dict(checkpoint["model_state"], strict=False)
-    logger.info("Loaded BC weights (value head initialized randomly)")
+    state_dict = checkpoint["model_state"]
+    if "proprio_projection.0.weight" in state_dict:
+        # Slice to keep only first 7 dimensions (remove timestep)
+        state_dict["proprio_projection.0.weight"] = state_dict["proprio_projection.0.weight"][:, :7]
+
+    # Load BC weights (actor head)
+    policy.load_state_dict(state_dict, strict=False)
+    logger.info("Loaded BC weights (sliced proprio_projection to 7D, value_head initialized randomly)")
 
     policy.to(device)
     policy.train()
@@ -359,6 +374,25 @@ def main() -> None:
         for key, value in train_metrics.items():
             writer.add_scalar(key, value, global_step)
             logger.info(f"  {key}: {value:.4f}")
+
+        # Check for divergence (NaN or extreme values)
+        if np.isnan(train_metrics["loss/total"]) or np.isinf(train_metrics["loss/total"]):
+            logger.error(f"Training diverged! Loss is {train_metrics['loss/total']}")
+            logger.error("Stopping training and saving checkpoint...")
+            checkpoint_path = output_dir / f"ppo_diverged_epoch_{epoch + 1}.pt"
+            torch.save({
+                "epoch": epoch + 1,
+                "model_state": policy.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "config": model_config.__dict__,
+                "global_step": global_step,
+            }, checkpoint_path)
+            break
+
+        # Check for extreme losses (potential divergence)
+        if train_metrics["loss/total"] > 1000:
+            logger.warning(f"Very high loss detected: {train_metrics['loss/total']:.2f}")
+            logger.warning("Training may be diverging. Consider lowering learning rate.")
 
         # Save best checkpoint based on success rate
         current_success_rate = rollout_metrics.get("rollout/success_rate", 0.0)
