@@ -176,8 +176,13 @@ def main() -> None:
     setup_logging()
     logger = get_logger("evaluate_ppo")
 
-    # Device setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Device setup - support M1/M2/M3 Mac GPU
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     logger.info(f"Using device: {device}")
 
     # Load checkpoint

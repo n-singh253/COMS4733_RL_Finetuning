@@ -24,8 +24,8 @@ policy:
   gamma: 0.99  # Discount factor
   gae_lambda: 0.95  # GAE lambda parameter
 
-  # Device
-  device: cuda
+  # Device (auto-detects cuda/mps/cpu)
+  device: auto
   seed: 42
 
 environment:
