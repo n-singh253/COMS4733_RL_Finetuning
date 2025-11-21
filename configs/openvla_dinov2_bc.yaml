@@ -5,7 +5,7 @@ dataset:
   batch_size: 16
   num_workers: 8
   sequence_length: 1
-  normalize_proprio: true  # Normalizes 7 joint positions (NO timestep - removed for testing)
+  normalize_proprio: true  # Normalizes 7 joint positions + adds normalized timestep (8th dim)
   cache_dataset: false
 
 model:
@@ -13,18 +13,18 @@ model:
   language_encoder: bert-base-uncased
   fusion_hidden_dim: 384  # Increased from 512 for better spatial reasoning
   fusion_layers: 2  # Increased from 2 for stronger vision-action coupling
-  action_dim: 8  # 7 joint positions + 1 gripper position (actions still 8-dim, proprio now 7-dim)
+  action_dim: 8  # 7 joint positions + 1 gripper position
   max_instruction_tokens: 64
-  freeze_vision: true  # CRITICAL: Allow vision encoder to learn task-specific features
+  freeze_vision: false  # CRITICAL: Allow vision encoder to learn task-specific features
   freeze_language: true  # Freeze BERT to reduce overfitting (simple instructions, pretrained is enough)
-  dropout: 0.2  # Reduced from 0.1 to retain more learned features
+  dropout: 0.15  # Reduced from 0.1 to retain more learned features
   history_length: 5  # Number of past actions for closed-loop control (sweet spot: not too short, not too long)
-  use_object_detection: false  # DISABLED: Timestep removal test first, then re-enable if needed
-  object_detection_weight: 10.0  # Weight for object detection auxiliary loss (helps vision learning)
+  use_object_detection: true  # Multi-task learning with PERFECT ground truth from MuJoCo!
+  object_detection_weight: 30.0  # VERY strong signal - force visual grounding despite frozen encoder
 
 training:
-  epochs: 20  # Extended training for better closed-loop control learning
-  lr: 0.0001 # Slightly lower than 0.0001 for more stable convergence
+  epochs: 40  # Extended training for better closed-loop control learning
+  lr: 0.00007  # Standard BC learning rate for frozen encoders
   weight_decay: 0.01
   grad_clip: 5.0  # Increased to prevent gradient spikes during early training
   device: cuda

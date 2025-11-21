@@ -27,6 +27,36 @@ from env.mujoco_env import FrankaPickPlaceEnv
 from env.controllers import KeyframeController, KinematicsHelper
 
 
+def world_to_image_coords(obj_pos_3d: np.ndarray, workspace_bounds: tuple = None) -> np.ndarray:
+    """Convert 3D world position to normalized 2D image coordinates [0, 1].
+    
+    Args:
+        obj_pos_3d: 3D position in world coordinates (x, y, z)
+        workspace_bounds: Tuple of ((x_min, x_max), (y_min, y_max)) or None for defaults
+    
+    Returns:
+        Normalized 2D position (x_norm, y_norm) in [0, 1] range
+    """
+    if workspace_bounds is None:
+        # Default workspace bounds for Franka pick-and-place task
+        x_min, x_max = 0.40, 0.65  # X range: 40cm to 65cm (25cm width)
+        y_min, y_max = -0.30, 0.30  # Y range: -30cm to 30cm (60cm depth)
+    else:
+        (x_min, x_max), (y_min, y_max) = workspace_bounds
+    
+    x_world, y_world, z_world = obj_pos_3d
+    
+    # Normalize to [0, 1] based on workspace bounds
+    x_norm = (x_world - x_min) / (x_max - x_min)
+    y_norm = (y_world - y_min) / (y_max - y_min)
+    
+    # Clamp to [0, 1] to handle objects slightly outside bounds
+    x_norm = float(np.clip(x_norm, 0.0, 1.0))
+    y_norm = float(np.clip(y_norm, 0.0, 1.0))
+    
+    return np.array([x_norm, y_norm], dtype=np.float32)
+
+
 @dataclass(slots=True)
 class EpisodeBuffer:
     """Stores trajectory information before writing to disk."""
@@ -35,14 +65,17 @@ class EpisodeBuffer:
     proprio: List[np.ndarray]
     actions: List[np.ndarray]
     timestamps: List[float]
+    object_positions: List[np.ndarray]  # NEW: Ground truth object positions (normalized [0,1])
     instruction: str
     meta: Dict[str, object]
 
-    def extend(self, obs: Dict[str, np.ndarray], action: np.ndarray, timestamp: float) -> None:
+    def extend(self, obs: Dict[str, np.ndarray], action: np.ndarray, timestamp: float, object_pos_normalized: np.ndarray) -> None:
+        """Add a step with ground truth object position."""
         self.rgb_frames.append((obs["rgb_static"] * 255).astype(np.uint8))
         self.proprio.append(obs["proprio"].astype(np.float32))
         self.actions.append(action.astype(np.float32))
         self.timestamps.append(float(timestamp))
+        self.object_positions.append(object_pos_normalized.astype(np.float32))
 
     def save(self, root: Path, episode_id: int) -> None:
         episode_dir = root / f"episode_{episode_id:04d}"
@@ -56,6 +89,9 @@ class EpisodeBuffer:
         np.save(episode_dir / "obs" / "proprio.npy", np.stack(self.proprio, axis=0))
         np.save(episode_dir / "actions.npy", np.stack(self.actions, axis=0))
         np.save(episode_dir / "timestamps.npy", np.asarray(self.timestamps, dtype=np.float32))
+        
+        # NEW: Save ground truth object positions
+        np.save(episode_dir / "obs" / "object_positions.npy", np.stack(self.object_positions, axis=0))
 
         (episode_dir / "instruction.txt").write_text(self.instruction)
         (episode_dir / "meta.json").write_text(json.dumps(self.meta, indent=2))
@@ -221,12 +257,11 @@ def compute_adaptive_keyframes(
     keyframes["grasp_closed"] = keyframes["grasp"]
     keyframes["lift"] = keyframes["pre_grasp"]  # Lift to pre_grasp height
     
-    # Transport and place keyframes (adjusted for bin at 0.55, 0.45 - closer to robot)
-    # Added intermediate waypoint for smooth, gradual motion to prevent slipping
-    keyframes["transport_mid"] = np.array([0.25, 0.325, -0.05, -1.95, 0.05, 2.05, -0.55])  # Halfway point
-    keyframes["transport"] = np.array([0.4, 0.35, 0.0, -1.8, 0.1, 2.1, -0.55])
-    keyframes["place"] = np.array([0.5, 0.3, 0.05, -1.7, 0.15, 2.0, -0.6])
-    keyframes["place_open"] = np.array([0.5, 0.3, 0.05, -1.7, 0.15, 2.0, -0.6])
+    # Transport and place keyframes (direct to bin, no intermediate waypoint)
+    keyframes["transport"] = np.array([0.4, 0.35, 0.0, -1.8, 0.1, 2.1, -0.55])  # Direct to above bin
+    keyframes["place"] = np.array([0.5, 0.3, 0.05, -1.7, 0.15, 2.0, -0.6])  # Position for release
+    keyframes["place_open"] = np.array([0.5, 0.3, 0.05, -1.7, 0.15, 2.0, -0.6])  # Open gripper
+    keyframes["hold_open"] = np.array([0.5, 0.3, 0.05, -1.7, 0.15, 2.0, -0.6])  # Brief hold to ensure drop
     
     return keyframes
 
@@ -257,19 +292,16 @@ def keyframe_policy(
     current_q = env.data.qpos[env._joint_qpos_indices].copy()
     current_qvel = env.data.qvel[env._joint_dof_indices].copy()
     
-    # DENSE DEMOS: Minimal dwell times for smooth, motion-rich trajectories
-    # Reduced from sparse keyframe holds (50-70 steps) to 8-15 steps
-    # This provides 4-5x more action diversity while maintaining physics stability
+    # ULTRA-DENSE DEMOS: Almost pure threshold-based transitions
+    # Minimal dwell times - transitions happen immediately when criteria met
     if keyframe_name == "grasp":
-        required_dwell = 10  # Reduced from 50 (5x less hold time)
+        required_dwell = 2   # Just ensure contact stability
     elif keyframe_name == "grasp_closed":
-        required_dwell = 15  # Reduced from 70 (4.6x less) - still ensures secure grip
-    elif keyframe_name == "lift":
-        required_dwell = 8   # Reduced from 30 (3.75x less)
-    elif keyframe_name == "transport":
-        required_dwell = 10  # Reduced from 50 (5x less)
+        required_dwell = 3   # Brief hold to secure grip (physics stability)
+    elif keyframe_name == "hold_open":
+        required_dwell = 8   # Hold after opening to ensure ball drops and settles
     else:
-        required_dwell = max(5, dwell_time // 5)  # General 5x reduction, minimum 5 steps
+        required_dwell = 1   # Single step minimum (immediate transition)
     
     # Check if we've converged and dwelled long enough
     if steps_at_keyframe >= required_dwell and controller.check_convergence(current_q, current_qvel, target_q):
@@ -282,10 +314,10 @@ def keyframe_policy(
     
     # Gripper control based on keyframe name
     # Keep gripper FIRMLY closed during all carrying phases
-    if "closed" in keyframe_name or keyframe_name in ["lift", "transport", "transport_mid", "place"]:
+    if "closed" in keyframe_name or keyframe_name in ["lift", "transport", "place"]:
         action[7] = 0.0  # Fully closed gripper (0.0m = maximum grip)
     else:
-        action[7] = 0.04  # Open gripper (0.04m = fully open) for approach, grasp, pre_grasp, etc.
+        action[7] = 0.04  # Open gripper (0.04m = fully open) for approach, grasp, pre_grasp, place_open, hold_open
     
     sequence_complete = controller.is_sequence_complete()
     
@@ -299,6 +331,7 @@ def collect_episode(env: FrankaPickPlaceEnv, hindered: bool, max_steps: int) -> 
         proprio=[],
         actions=[],
         timestamps=[],
+        object_positions=[],  # NEW: Initialize empty list for object positions
         instruction=info["instruction"],
         meta=info,
     )
@@ -323,10 +356,10 @@ def collect_episode(env: FrankaPickPlaceEnv, hindered: bool, max_steps: int) -> 
         velocity_threshold=0.15,      # 0.15 rad/s
     )
     
-    # Set pick-and-place sequence with gradual transport motion
+    # Set pick-and-place sequence (direct transport, no intermediate waypoint)
     pick_place_sequence = [
         "home", "pre_grasp", "grasp", "grasp_closed", "lift",
-        "transport_mid", "transport", "place", "place_open", "home"
+        "transport", "place", "place_open", "hold_open"  # End with hold_open to ensure ball drops
     ]
     controller.set_sequence(pick_place_sequence)
 
@@ -338,8 +371,12 @@ def collect_episode(env: FrankaPickPlaceEnv, hindered: bool, max_steps: int) -> 
         # Get action from keyframe policy
         action, sequence_complete = keyframe_policy(env, controller, steps_at_keyframe, dwell_time=20)
         
-        # Record data
-        buffer.extend(obs, action, timestamp)
+        # Get current object position and convert to normalized image coordinates
+        current_obj_pos_3d = env.data.site_xpos[target_site_id].copy()
+        obj_pos_normalized = world_to_image_coords(current_obj_pos_3d)
+        
+        # Record data with ground truth object position
+        buffer.extend(obs, action, timestamp, obj_pos_normalized)
         
         # Step environment
         result = env.step(action)
@@ -368,9 +405,20 @@ def collect_episode(env: FrankaPickPlaceEnv, hindered: bool, max_steps: int) -> 
             print(f"  Episode terminated at step {step_idx}")
             break
         
+        # End only when sequence complete AND ball is successfully in box
         if sequence_complete:
-            print(f"  Pick-and-place sequence complete at step {step_idx}")
-            break
+            # Check if ball is actually in the box (success condition)
+            obj_pos = env.data.site_xpos[target_site_id]
+            horizontal_dist = np.linalg.norm(obj_pos[:2] - env.bin_position[:2])
+            obj_in_bin = horizontal_dist < env.bin_radius and obj_pos[2] < 0.08
+            
+            if obj_in_bin:
+                print(f"  ✓ Ball in box! Episode complete at step {step_idx}")
+                break
+            elif step_idx >= 150:
+                # Safety: end after 150 steps even if not successful (prevents infinite loop)
+                print(f"  ⚠ Max steps reached, ending episode (ball not in box)")
+                break
 
     buffer.meta.update(
         {

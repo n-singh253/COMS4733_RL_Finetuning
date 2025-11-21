@@ -87,7 +87,7 @@ class FrankaPickPlaceEnv:
 
         self.step_dt = 0.04
         self.control_rate_hz = 1.0 / self.step_dt
-        self.max_steps = 200  # Must match MAX_EPISODE_STEPS in dataset/evaluation for consistent timestep normalization (dense demos avg 175)
+        self.max_steps = 184  # Must match MAX_EPISODE_STEPS in dataset/evaluation for consistent timestep normalization (ultra-dense demos: 133-164, avg 147)
         self.success_height = 0.15  # Height threshold for considering object "placed"
         self.workspace_extent = np.array([0.25, 0.25])
         self.bin_position = np.array([0.55, 0.45, 0.08])  # Closer to robot for easier center placement

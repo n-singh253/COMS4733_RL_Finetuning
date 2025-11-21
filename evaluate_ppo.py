@@ -87,9 +87,9 @@ def evaluate_policy(
                 rgb = torch.from_numpy(obs["rgb_static"]).to(device).float().permute(2, 0, 1).unsqueeze(0)
                 proprio = torch.from_numpy(obs["proprio"]).to(device).float()
 
-                # REMOVED TIMESTEP: Testing hypothesis that timestep enables harmful open-loop behavior
-                # Model now receives only joint positions (7 dims), forcing it to rely on vision + action history
-                proprio = proprio.unsqueeze(0)  # Add batch dimension: (7,) -> (1, 7)
+                # Add timestep to proprio
+                timestep = torch.tensor([episode_length / env.max_steps], device=device, dtype=torch.float32)
+                proprio = torch.cat([proprio, timestep], dim=-1).unsqueeze(0)
 
                 # Get action history
                 action_history = action_tracker.get().unsqueeze(0)

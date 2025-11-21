@@ -121,19 +121,41 @@ class RobotVisionAugmentation:
         return img
 
 
-def get_train_augmentation(image_size: int = 224) -> RobotVisionAugmentation:
-    """Get augmentation transform for training."""
-    return RobotVisionAugmentation(
-        image_size=image_size,
-        brightness=0.2,
-        contrast=0.2,
-        saturation=0.2,
-        hue=0.05,
-        random_crop_scale=(0.9, 1.0),
-        random_rotation=5.0,
-        random_erasing_prob=0.1,
-        enabled=True,
-    )
+def get_train_augmentation(image_size: int = 224, strong_color_aug: bool = False) -> RobotVisionAugmentation:
+    """Get augmentation transform for training.
+    
+    Args:
+        image_size: Target size
+        strong_color_aug: Use stronger color augmentation to help frozen vision encoder
+                         learn color-invariant features
+    """
+    if strong_color_aug:
+        # STRONG color augmentation for frozen vision encoder
+        # Forces model to learn robust color features despite frozen DINOv2
+        return RobotVisionAugmentation(
+            image_size=image_size,
+            brightness=0.3,      # Increased from 0.2
+            contrast=0.3,        # Increased from 0.2
+            saturation=0.4,      # Increased from 0.2 (more color variation)
+            hue=0.15,            # Increased from 0.05 (CRITICAL for color discrimination)
+            random_crop_scale=(0.85, 1.0),  # Slightly more aggressive
+            random_rotation=8.0,  # Slightly more rotation
+            random_erasing_prob=0.15,  # More occlusion
+            enabled=True,
+        )
+    else:
+        # Standard augmentation
+        return RobotVisionAugmentation(
+            image_size=image_size,
+            brightness=0.2,
+            contrast=0.2,
+            saturation=0.2,
+            hue=0.05,
+            random_crop_scale=(0.9, 1.0),
+            random_rotation=5.0,
+            random_erasing_prob=0.1,
+            enabled=True,
+        )
 
 
 def get_val_augmentation(image_size: int = 224) -> RobotVisionAugmentation:

@@ -104,28 +104,33 @@ class LeRobotDataset(Dataset):
             else:
                 sample["rgb_static"] = torch.stack(frames, dim=0)
             
-            # Extract ground truth object position from RGB image (for multi-task learning)
-            # Use color-based detection on the first frame
-            if self.sequence_length == 1:
-                rgb_for_detection = frames[0]
+            # Extract object position: use ground truth if available, fallback to RGB detection
+            if data.get("object_positions") is not None:
+                # NEW: Use ground truth object position from MuJoCo (accurate, no noise)
+                obj_pos = data["object_positions"][start_t]  # Already normalized to [0,1]
+                sample["object_position"] = torch.from_numpy(obj_pos).float()
             else:
-                rgb_for_detection = frames[0]  # Use first frame
-            
-            # Convert from (C, H, W) to (H, W, C) for detection
-            rgb_np = rgb_for_detection.permute(1, 2, 0).numpy()
-            # Extract target color from instruction (e.g. "Pick up the red sphere...")
-            instruction = episode.instruction.lower()
-            if "red" in instruction:
-                target_color = "red"
-            elif "green" in instruction:
-                target_color = "green"
-            elif "blue" in instruction:
-                target_color = "blue"
-            else:
-                target_color = "red"  # default
-            
-            obj_x, obj_y = detect_object_position_from_rgb(rgb_np, target_color=target_color)
-            sample["object_position"] = torch.tensor([obj_x, obj_y], dtype=torch.float32)
+                # FALLBACK: Use color-based detection from RGB (for old datasets)
+                if self.sequence_length == 1:
+                    rgb_for_detection = frames[0]
+                else:
+                    rgb_for_detection = frames[0]  # Use first frame
+                
+                # Convert from (C, H, W) to (H, W, C) for detection
+                rgb_np = rgb_for_detection.permute(1, 2, 0).numpy()
+                # Extract target color from instruction (e.g. "Pick up the red sphere...")
+                instruction = episode.instruction.lower()
+                if "red" in instruction:
+                    target_color = "red"
+                elif "green" in instruction:
+                    target_color = "green"
+                elif "blue" in instruction:
+                    target_color = "blue"
+                else:
+                    target_color = "red"  # default
+                
+                obj_x, obj_y = detect_object_position_from_rgb(rgb_np, target_color=target_color)
+                sample["object_position"] = torch.tensor([obj_x, obj_y], dtype=torch.float32)
 
         if "proprio" in self.modalities:
             proprio = torch.from_numpy(data["proprio"][start_t:end_t]).float()
@@ -136,9 +141,16 @@ class LeRobotDataset(Dataset):
                 joint_max = 2.8973
                 proprio = 2.0 * (proprio - joint_min) / (joint_max - joint_min) - 1.0
             
-            # REMOVED TIMESTEP: Testing hypothesis that timestep enables harmful open-loop behavior
-            # The model should rely on visual feedback and action history, not timestep
-            # proprio is now pure joint positions (7 dims) without temporal cue
+            # ADD TIMESTEP as 8th dimension for temporal awareness
+            # Normalize timestep to [0, 1] using FIXED max_steps to match evaluation
+            # CRITICAL: Must use same normalization as evaluate_bc_mujoco.py
+            # Updated for ultra-dense demos: max episode length 164, use 184 for safety
+            MAX_EPISODE_STEPS = 184  # Fixed constant matching ultra-dense demo lengths (133-164, avg 147)
+            timesteps = torch.arange(start_t, end_t, dtype=torch.float32) / MAX_EPISODE_STEPS
+            timesteps = timesteps.unsqueeze(-1)  # Shape: (seq_len, 1)
+            
+            # Concatenate: (seq_len, 7) + (seq_len, 1) → (seq_len, 8)
+            proprio = torch.cat([proprio, timesteps], dim=-1)
             
             sample["proprio"] = proprio if self.sequence_length > 1 else proprio.squeeze(0)
 
@@ -295,8 +307,19 @@ class LeRobotDataset(Dataset):
         actions_path = episode.path / "actions.npy"
         proprio = np.load(proprio_path) if proprio_path.exists() else np.zeros((episode.length, 7), dtype=np.float32)
         actions = np.load(actions_path)
+        
+        # NEW: Load ground truth object positions if available
+        object_positions_path = episode.path / "obs" / "object_positions.npy"
+        object_positions = None
+        if object_positions_path.exists():
+            object_positions = np.load(object_positions_path)
 
-        data = {"rgb_static": image_paths, "proprio": proprio, "actions": actions}
+        data = {
+            "rgb_static": image_paths, 
+            "proprio": proprio, 
+            "actions": actions,
+            "object_positions": object_positions,  # NEW: Include object positions
+        }
         self._episode_cache[cache_key] = data
         return data
 

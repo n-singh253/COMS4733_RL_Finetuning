@@ -35,7 +35,9 @@ def build_dataloader(
     # Use augmentation for training, not for validation
     is_train = split == dataset_cfg.get("train_split", "train")
     if use_augmentation and is_train:
-        image_transform = get_train_augmentation(image_size=224)
+        # Use strong color augmentation if vision encoder is frozen
+        strong_color_aug = model_cfg.get("freeze_vision", True)
+        image_transform = get_train_augmentation(image_size=224, strong_color_aug=strong_color_aug)
     else:
         image_transform = get_val_augmentation(image_size=224)
 
@@ -238,8 +240,7 @@ def train_one_epoch(
             
             # Compute weighted loss with HIGHER gripper weighting
             # Need strong emphasis on gripper to learn open/close behavior
-            epoch_progress = epoch / total_epochs
-            gripper_weight = 10.0  # Fixed high weight (was adaptive 3x → 1.5x, too low)
+            gripper_weight = 10.0  # Fixed high weight (not adaptive)
             
             joint_loss = criterion(pred[:, :7], target[:, :7])
             gripper_loss = criterion(pred[:, 7:8], target[:, 7:8])

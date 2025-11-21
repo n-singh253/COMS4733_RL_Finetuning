@@ -50,7 +50,7 @@ class VLADinoV2Policy(nn.Module):
             nn.Linear(language_dim, config.fusion_hidden_dim),
         )
         self.proprio_projection = nn.Sequential(
-            nn.Linear(7, config.fusion_hidden_dim),  # 7 joints ONLY (no timestep)
+            nn.Linear(8, config.fusion_hidden_dim),  # 7 joints + 1 timestep
             nn.ReLU(),
             nn.Linear(config.fusion_hidden_dim, config.fusion_hidden_dim),
         )
@@ -88,9 +88,14 @@ class VLADinoV2Policy(nn.Module):
         # Object detection head for multi-task learning
         # Predicts 2D object position in image space (normalized [0,1])
         if config.use_object_detection:
+            # Explicit color embedding to handle multi-object scenes
+            # BERT embeddings are 99.7% similar across colors - too weak!
+            self.color_names = ["red", "green", "blue", "yellow", "purple"]
+            self.color_embedding = nn.Embedding(len(self.color_names), 64)
+            
             self.object_detection_head = nn.Sequential(
-                nn.LayerNorm(config.fusion_hidden_dim),
-                nn.Linear(config.fusion_hidden_dim, 256),
+                nn.LayerNorm(config.fusion_hidden_dim + 64),  # +64 for color embedding
+                nn.Linear(config.fusion_hidden_dim + 64, 256),
                 nn.ReLU(),
                 nn.Dropout(config.dropout),
                 nn.Linear(256, 2),  # (x, y) in normalized image coordinates
@@ -98,6 +103,7 @@ class VLADinoV2Policy(nn.Module):
             )
         else:
             self.object_detection_head = None
+            self.color_embedding = None
 
         if config.freeze_vision:
             for param in self.vision_encoder.parameters():
@@ -121,7 +127,7 @@ class VLADinoV2Policy(nn.Module):
         Args:
             rgb_static: Batch of RGB images ``(B, C, H, W)`` normalized to ``[0, 1]``.
             instruction: Batch of natural-language strings.
-            proprio: Batch of proprioceptive vectors ``(B, 7)`` - 7 joints only (no timestep).
+            proprio: Batch of proprioceptive vectors ``(B, 8)`` - 7 joints + 1 timestep.
             action_history: Batch of past actions ``(B, history_length, action_dim)`` or None.
         """
         pooled = self._get_fused_features(rgb_static, instruction, proprio, action_history)
@@ -174,7 +180,7 @@ class VLADinoV2Policy(nn.Module):
         Args:
             rgb_static: Batch of RGB images ``(B, C, H, W)`` normalized to ``[0, 1]``.
             instruction: Batch of natural-language strings.
-            proprio: Batch of proprioceptive vectors ``(B, 7)`` - 7 joints only (no timestep).
+            proprio: Batch of proprioceptive vectors ``(B, 8)`` - 7 joints + 1 timestep.
             action_history: Batch of past actions ``(B, history_length, action_dim)`` or None.
 
         Returns:
@@ -195,7 +201,7 @@ class VLADinoV2Policy(nn.Module):
         Args:
             rgb_static: Batch of RGB images ``(B, C, H, W)`` normalized to ``[0, 1]``.
             instruction: Batch of natural-language strings.
-            proprio: Batch of proprioceptive vectors ``(B, 7)`` - 7 joints only (no timestep).
+            proprio: Batch of proprioceptive vectors ``(B, 8)`` - 7 joints + 1 timestep.
             action_history: Batch of past actions ``(B, history_length, action_dim)`` or None.
 
         Returns:
@@ -204,7 +210,35 @@ class VLADinoV2Policy(nn.Module):
         if self.object_detection_head is None:
             raise RuntimeError("Object detection head not initialized. Set use_object_detection=True in config.")
         pooled = self._get_fused_features(rgb_static, instruction, proprio, action_history)
-        return self.object_detection_head(pooled)
+        
+        # Extract color from instruction and add explicit color embedding
+        # This provides a STRONG signal since BERT embeddings are 99.7% similar across colors
+        color_ids = self._extract_color_ids(instruction)
+        color_embed = self.color_embedding(color_ids)  # (B, 64)
+        
+        # Concatenate fused features with color embedding
+        detection_input = torch.cat([pooled, color_embed], dim=-1)  # (B, fusion_dim + 64)
+        return self.object_detection_head(detection_input)
+
+    def _extract_color_ids(self, instructions: List[str]) -> torch.Tensor:
+        """Extract color IDs from instruction strings.
+        
+        Args:
+            instructions: List of instruction strings (e.g., "Pick up the red sphere...")
+            
+        Returns:
+            Tensor of color IDs (B,) - indices into self.color_names
+        """
+        color_ids = []
+        for instruction in instructions:
+            instruction_lower = instruction.lower()
+            color_id = 0  # Default to red
+            for idx, color in enumerate(self.color_names):
+                if color in instruction_lower:
+                    color_id = idx
+                    break
+            color_ids.append(color_id)
+        return torch.tensor(color_ids, dtype=torch.long, device=next(self.parameters()).device)
 
     def get_action_and_value(
         self,
@@ -219,7 +253,7 @@ class VLADinoV2Policy(nn.Module):
         Args:
             rgb_static: Batch of RGB images ``(B, C, H, W)`` normalized to ``[0, 1]``.
             instruction: Batch of natural-language strings.
-            proprio: Batch of proprioceptive vectors ``(B, 7)`` - 7 joints only (no timestep).
+            proprio: Batch of proprioceptive vectors ``(B, 8)`` - 7 joints + 1 timestep.
             action_history: Batch of past actions ``(B, history_length, action_dim)`` or None.
             action_std: Standard deviation for action noise.
 
@@ -254,7 +288,7 @@ class VLADinoV2Policy(nn.Module):
         Args:
             rgb_static: Batch of RGB images ``(B, C, H, W)`` normalized to ``[0, 1]``.
             instruction: Batch of natural-language strings.
-            proprio: Batch of proprioceptive vectors ``(B, 7)`` - 7 joints only (no timestep).
+            proprio: Batch of proprioceptive vectors ``(B, 8)`` - 7 joints + 1 timestep.
             actions: Actions to evaluate of shape ``(B, action_dim)``.
             action_history: Batch of past actions ``(B, history_length, action_dim)`` or None.
             action_std: Standard deviation for action noise.

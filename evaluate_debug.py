@@ -9,7 +9,7 @@ from env.mujoco_env import FrankaPickPlaceEnv
 from models.vla_dinov2 import VLADinoV2Config, VLADinoV2Policy
 
 
-def preprocess_observation(observation, image_processor, device, timestep, max_steps=200):
+def preprocess_observation(observation, image_processor, device, timestep, max_steps=184):
     """Same as evaluate_bc_mujoco.py but with logging."""
     rgb = observation.get("rgb_static")
     proprio = observation.get("proprio")
@@ -26,7 +26,7 @@ def preprocess_observation(observation, image_processor, device, timestep, max_s
     rgb_tensor = inputs["pixel_values"].to(device)
     
     if proprio is None:
-        proprio_tensor = torch.zeros(1, 7, device=device)  # 7 joints only (no timestep)
+        proprio_tensor = torch.zeros(1, 8, device=device)
     else:
         proprio_array = np.asarray(proprio, dtype=np.float32)
         proprio_tensor = torch.from_numpy(proprio_array).float().to(device).unsqueeze(0)
@@ -38,9 +38,10 @@ def preprocess_observation(observation, image_processor, device, timestep, max_s
         joint_max = 2.8973
         proprio_tensor = 2.0 * (proprio_tensor - joint_min) / (joint_max - joint_min) - 1.0
     
-    # REMOVED TIMESTEP: Testing hypothesis that timestep enables harmful open-loop behavior
-    # Model now receives only joint positions (7 dims), forcing it to rely on vision + action history
+    # Add timestep
     timestep_normalized = timestep / max(max_steps, 1)
+    timestep_tensor = torch.tensor([[timestep_normalized]], dtype=torch.float32, device=device)
+    proprio_tensor = torch.cat([proprio_tensor, timestep_tensor], dim=-1)
     
     return rgb_tensor, proprio_tensor, timestep_normalized
 
@@ -112,7 +113,7 @@ def main():
             
             # Preprocess
             rgb_tensor, proprio_tensor, timestep_norm = preprocess_observation(
-                observation, image_processor, device, timestep=step, max_steps=200
+                observation, image_processor, device, timestep=step, max_steps=184
             )
             
             # Predict
